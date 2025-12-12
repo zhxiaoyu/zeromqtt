@@ -1,4 +1,5 @@
 //! Bridge core - orchestrates MQTT and ZeroMQ message forwarding
+//! Now supports multiple MQTT brokers and XPUB/XSUB proxy pattern
 
 use crate::db::Repository;
 use crate::models::{BridgeState, BridgeStatus, ConnectionStatus};
@@ -69,9 +70,9 @@ impl BridgeCore {
         info!("Starting bridge...");
         *self.state.write().await = BridgeState::Connecting;
 
-        // Load configurations
-        let mqtt_config = self.repo.get_mqtt_config().await?;
-        let zmq_config = self.repo.get_zmq_config().await?;
+        // Load configurations - now supporting multiple configs
+        let mqtt_configs = self.repo.get_mqtt_configs().await?;
+        let zmq_configs = self.repo.get_zmq_configs().await?;
         let mappings = self.repo.get_mappings().await?;
 
         // Update topic mapper
@@ -80,10 +81,10 @@ impl BridgeCore {
         // Reset stats and record start time
         let _ = self.repo.reset_stats().await;
 
-        // Start the worker
+        // Start the worker with all configs
         {
             let mut worker = self.worker.lock();
-            worker.start(mqtt_config, zmq_config, mappings, self.repo.clone())?;
+            worker.start_extended(mqtt_configs, zmq_configs, mappings, self.repo.clone())?;
         }
 
         *self.state.write().await = BridgeState::Running;

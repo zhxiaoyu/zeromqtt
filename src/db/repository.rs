@@ -1,8 +1,9 @@
 //! Repository implementations for database access
 
 use crate::models::{
-    CreateMappingRequest, MappingDirection,
-    MessageStats, MqttConfig, TopicMapping, ZmqConfig,
+    CreateMappingRequest, CreateMqttConfigRequest, CreateZmqConfigRequest,
+    EndpointType, MappingDirection, MessageStats, MqttConfig, TopicMapping,
+    ZmqConfig, ZmqSocketType,
 };
 use sqlx::sqlite::SqlitePool;
 use sqlx::FromRow;
@@ -10,8 +11,11 @@ use sqlx::FromRow;
 // ============ Row Types for SQLite ============
 
 #[derive(FromRow)]
+#[allow(dead_code)]
 struct MqttConfigRow {
     id: i64,
+    name: String,
+    enabled: i64,
     broker_url: String,
     port: i64,
     client_id: String,
@@ -26,6 +30,8 @@ impl From<MqttConfigRow> for MqttConfig {
     fn from(row: MqttConfigRow) -> Self {
         MqttConfig {
             id: Some(row.id as u32),
+            name: row.name,
+            enabled: row.enabled != 0,
             broker_url: row.broker_url,
             port: row.port as u16,
             client_id: row.client_id,
@@ -39,20 +45,39 @@ impl From<MqttConfigRow> for MqttConfig {
 }
 
 #[derive(FromRow)]
+#[allow(dead_code)]
 struct ZmqConfigRow {
     id: i64,
-    pub_endpoint: String,
-    sub_endpoint: String,
+    name: String,
+    enabled: i64,
+    socket_type: String,
+    bind_endpoint: Option<String>,
+    connect_endpoints: Option<String>,
     high_water_mark: i64,
     reconnect_interval_ms: i64,
 }
 
 impl From<ZmqConfigRow> for ZmqConfig {
     fn from(row: ZmqConfigRow) -> Self {
+        let socket_type = match row.socket_type.as_str() {
+            "xpub" => ZmqSocketType::XPub,
+            "xsub" => ZmqSocketType::XSub,
+            "pub" => ZmqSocketType::Pub,
+            "sub" => ZmqSocketType::Sub,
+            _ => ZmqSocketType::XPub,
+        };
+        
+        let connect_endpoints: Vec<String> = row.connect_endpoints
+            .map(|s| s.split(',').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
         ZmqConfig {
             id: Some(row.id as u32),
-            pub_endpoint: row.pub_endpoint,
-            sub_endpoint: row.sub_endpoint,
+            name: row.name,
+            enabled: row.enabled != 0,
+            socket_type,
+            bind_endpoint: row.bind_endpoint,
+            connect_endpoints,
             high_water_mark: row.high_water_mark as u32,
             reconnect_interval_ms: row.reconnect_interval_ms as u32,
         }
@@ -60,8 +85,13 @@ impl From<ZmqConfigRow> for ZmqConfig {
 }
 
 #[derive(FromRow)]
+#[allow(dead_code)]
 struct TopicMappingRow {
     id: i64,
+    source_endpoint_type: String,
+    source_endpoint_id: i64,
+    target_endpoint_type: String,
+    target_endpoint_id: i64,
     source_topic: String,
     target_topic: String,
     direction: String,
@@ -73,11 +103,28 @@ impl From<TopicMappingRow> for TopicMapping {
     fn from(row: TopicMappingRow) -> Self {
         let direction = match row.direction.as_str() {
             "zmq_to_mqtt" => MappingDirection::ZmqToMqtt,
+            "mqtt_to_mqtt" => MappingDirection::MqttToMqtt,
+            "zmq_to_zmq" => MappingDirection::ZmqToZmq,
             "bidirectional" => MappingDirection::Bidirectional,
             _ => MappingDirection::MqttToZmq,
         };
+        
+        let source_endpoint_type = match row.source_endpoint_type.as_str() {
+            "zmq" => EndpointType::Zmq,
+            _ => EndpointType::Mqtt,
+        };
+        
+        let target_endpoint_type = match row.target_endpoint_type.as_str() {
+            "zmq" => EndpointType::Zmq,
+            _ => EndpointType::Mqtt,
+        };
+
         TopicMapping {
             id: row.id as u32,
+            source_endpoint_type,
+            source_endpoint_id: row.source_endpoint_id as u32,
+            target_endpoint_type,
+            target_endpoint_id: row.target_endpoint_id as u32,
             source_topic: row.source_topic,
             target_topic: row.target_topic,
             direction,
@@ -111,72 +158,195 @@ impl Repository {
         Self { pool }
     }
 
-    // ============ MQTT Config ============
+    // ============ MQTT Configs (Multiple Brokers) ============
 
-    pub async fn get_mqtt_config(&self) -> Result<MqttConfig, sqlx::Error> {
-        let row: MqttConfigRow = sqlx::query_as("SELECT * FROM mqtt_config WHERE id = 1")
-            .fetch_one(&self.pool)
+    pub async fn get_mqtt_configs(&self) -> Result<Vec<MqttConfig>, sqlx::Error> {
+        let rows: Vec<MqttConfigRow> = sqlx::query_as("SELECT * FROM mqtt_configs ORDER BY id")
+            .fetch_all(&self.pool)
             .await?;
-        Ok(row.into())
+        Ok(rows.into_iter().map(|r| r.into()).collect())
     }
 
-    pub async fn update_mqtt_config(&self, config: &MqttConfig) -> Result<MqttConfig, sqlx::Error> {
-        sqlx::query(
+    pub async fn get_mqtt_config(&self, id: u32) -> Result<Option<MqttConfig>, sqlx::Error> {
+        let row: Option<MqttConfigRow> = sqlx::query_as("SELECT * FROM mqtt_configs WHERE id = ?")
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.into()))
+    }
+
+    pub async fn add_mqtt_config(&self, req: &CreateMqttConfigRequest) -> Result<MqttConfig, sqlx::Error> {
+        let result = sqlx::query(
             r#"
-            UPDATE mqtt_config SET
-                broker_url = ?,
-                port = ?,
-                client_id = ?,
-                username = ?,
-                password = ?,
-                use_tls = ?,
-                keep_alive_seconds = ?,
-                clean_session = ?
-            WHERE id = 1
+            INSERT INTO mqtt_configs (name, enabled, broker_url, port, client_id, username, password, use_tls, keep_alive_seconds, clean_session)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
-        .bind(&config.broker_url)
-        .bind(config.port as i64)
-        .bind(&config.client_id)
-        .bind(&config.username)
-        .bind(&config.password)
-        .bind(if config.use_tls { 1i64 } else { 0i64 })
-        .bind(config.keep_alive_seconds as i64)
-        .bind(if config.clean_session { 1i64 } else { 0i64 })
+        .bind(&req.name)
+        .bind(if req.enabled { 1i64 } else { 0i64 })
+        .bind(&req.broker_url)
+        .bind(req.port as i64)
+        .bind(&req.client_id)
+        .bind(&req.username)
+        .bind(&req.password)
+        .bind(if req.use_tls { 1i64 } else { 0i64 })
+        .bind(req.keep_alive_seconds as i64)
+        .bind(if req.clean_session { 1i64 } else { 0i64 })
         .execute(&self.pool)
         .await?;
 
-        self.get_mqtt_config().await
+        let id = result.last_insert_rowid() as u32;
+        Ok(MqttConfig {
+            id: Some(id),
+            name: req.name.clone(),
+            enabled: req.enabled,
+            broker_url: req.broker_url.clone(),
+            port: req.port,
+            client_id: req.client_id.clone(),
+            username: req.username.clone(),
+            password: req.password.clone(),
+            use_tls: req.use_tls,
+            keep_alive_seconds: req.keep_alive_seconds,
+            clean_session: req.clean_session,
+        })
     }
 
-    // ============ ZMQ Config ============
-
-    pub async fn get_zmq_config(&self) -> Result<ZmqConfig, sqlx::Error> {
-        let row: ZmqConfigRow = sqlx::query_as("SELECT * FROM zmq_config WHERE id = 1")
-            .fetch_one(&self.pool)
-            .await?;
-        Ok(row.into())
-    }
-
-    pub async fn update_zmq_config(&self, config: &ZmqConfig) -> Result<ZmqConfig, sqlx::Error> {
-        sqlx::query(
+    pub async fn update_mqtt_config(&self, id: u32, req: &CreateMqttConfigRequest) -> Result<Option<MqttConfig>, sqlx::Error> {
+        let result = sqlx::query(
             r#"
-            UPDATE zmq_config SET
-                pub_endpoint = ?,
-                sub_endpoint = ?,
-                high_water_mark = ?,
-                reconnect_interval_ms = ?
-            WHERE id = 1
+            UPDATE mqtt_configs SET
+                name = ?, enabled = ?, broker_url = ?, port = ?, client_id = ?,
+                username = ?, password = ?, use_tls = ?, keep_alive_seconds = ?, clean_session = ?
+            WHERE id = ?
             "#,
         )
-        .bind(&config.pub_endpoint)
-        .bind(&config.sub_endpoint)
-        .bind(config.high_water_mark as i64)
-        .bind(config.reconnect_interval_ms as i64)
+        .bind(&req.name)
+        .bind(if req.enabled { 1i64 } else { 0i64 })
+        .bind(&req.broker_url)
+        .bind(req.port as i64)
+        .bind(&req.client_id)
+        .bind(&req.username)
+        .bind(&req.password)
+        .bind(if req.use_tls { 1i64 } else { 0i64 })
+        .bind(req.keep_alive_seconds as i64)
+        .bind(if req.clean_session { 1i64 } else { 0i64 })
+        .bind(id as i64)
         .execute(&self.pool)
         .await?;
 
-        self.get_zmq_config().await
+        if result.rows_affected() > 0 {
+            self.get_mqtt_config(id).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn delete_mqtt_config(&self, id: u32) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM mqtt_configs WHERE id = ?")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    // ============ ZMQ Configs (XPUB/XSUB) ============
+
+    pub async fn get_zmq_configs(&self) -> Result<Vec<ZmqConfig>, sqlx::Error> {
+        let rows: Vec<ZmqConfigRow> = sqlx::query_as("SELECT * FROM zmq_configs ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    pub async fn get_zmq_config(&self, id: u32) -> Result<Option<ZmqConfig>, sqlx::Error> {
+        let row: Option<ZmqConfigRow> = sqlx::query_as("SELECT * FROM zmq_configs WHERE id = ?")
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.into()))
+    }
+
+    pub async fn add_zmq_config(&self, req: &CreateZmqConfigRequest) -> Result<ZmqConfig, sqlx::Error> {
+        let socket_type = match req.socket_type {
+            ZmqSocketType::XPub => "xpub",
+            ZmqSocketType::XSub => "xsub",
+            ZmqSocketType::Pub => "pub",
+            ZmqSocketType::Sub => "sub",
+        };
+        
+        let connect_endpoints = req.connect_endpoints.join(",");
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO zmq_configs (name, enabled, socket_type, bind_endpoint, connect_endpoints, high_water_mark, reconnect_interval_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(&req.name)
+        .bind(if req.enabled { 1i64 } else { 0i64 })
+        .bind(socket_type)
+        .bind(&req.bind_endpoint)
+        .bind(&connect_endpoints)
+        .bind(req.high_water_mark as i64)
+        .bind(req.reconnect_interval_ms as i64)
+        .execute(&self.pool)
+        .await?;
+
+        let id = result.last_insert_rowid() as u32;
+        Ok(ZmqConfig {
+            id: Some(id),
+            name: req.name.clone(),
+            enabled: req.enabled,
+            socket_type: req.socket_type.clone(),
+            bind_endpoint: req.bind_endpoint.clone(),
+            connect_endpoints: req.connect_endpoints.clone(),
+            high_water_mark: req.high_water_mark,
+            reconnect_interval_ms: req.reconnect_interval_ms,
+        })
+    }
+
+    pub async fn update_zmq_config(&self, id: u32, req: &CreateZmqConfigRequest) -> Result<Option<ZmqConfig>, sqlx::Error> {
+        let socket_type = match req.socket_type {
+            ZmqSocketType::XPub => "xpub",
+            ZmqSocketType::XSub => "xsub",
+            ZmqSocketType::Pub => "pub",
+            ZmqSocketType::Sub => "sub",
+        };
+        
+        let connect_endpoints = req.connect_endpoints.join(",");
+
+        let result = sqlx::query(
+            r#"
+            UPDATE zmq_configs SET
+                name = ?, enabled = ?, socket_type = ?, bind_endpoint = ?,
+                connect_endpoints = ?, high_water_mark = ?, reconnect_interval_ms = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&req.name)
+        .bind(if req.enabled { 1i64 } else { 0i64 })
+        .bind(socket_type)
+        .bind(&req.bind_endpoint)
+        .bind(&connect_endpoints)
+        .bind(req.high_water_mark as i64)
+        .bind(req.reconnect_interval_ms as i64)
+        .bind(id as i64)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            self.get_zmq_config(id).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn delete_zmq_config(&self, id: u32) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM zmq_configs WHERE id = ?")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     // ============ Topic Mappings ============
@@ -193,15 +363,31 @@ impl Repository {
         let direction = match req.direction {
             MappingDirection::MqttToZmq => "mqtt_to_zmq",
             MappingDirection::ZmqToMqtt => "zmq_to_mqtt",
+            MappingDirection::MqttToMqtt => "mqtt_to_mqtt",
+            MappingDirection::ZmqToZmq => "zmq_to_zmq",
             MappingDirection::Bidirectional => "bidirectional",
+        };
+        
+        let source_type = match req.source_endpoint_type {
+            EndpointType::Mqtt => "mqtt",
+            EndpointType::Zmq => "zmq",
+        };
+        
+        let target_type = match req.target_endpoint_type {
+            EndpointType::Mqtt => "mqtt",
+            EndpointType::Zmq => "zmq",
         };
 
         let result = sqlx::query(
             r#"
-            INSERT INTO topic_mappings (source_topic, target_topic, direction, enabled, description)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO topic_mappings (source_endpoint_type, source_endpoint_id, target_endpoint_type, target_endpoint_id, source_topic, target_topic, direction, enabled, description)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
+        .bind(source_type)
+        .bind(req.source_endpoint_id as i64)
+        .bind(target_type)
+        .bind(req.target_endpoint_id as i64)
         .bind(&req.source_topic)
         .bind(&req.target_topic)
         .bind(direction)
@@ -213,6 +399,10 @@ impl Repository {
         let id = result.last_insert_rowid() as u32;
         Ok(TopicMapping {
             id,
+            source_endpoint_type: req.source_endpoint_type.clone(),
+            source_endpoint_id: req.source_endpoint_id,
+            target_endpoint_type: req.target_endpoint_type.clone(),
+            target_endpoint_id: req.target_endpoint_id,
             source_topic: req.source_topic.clone(),
             target_topic: req.target_topic.clone(),
             direction: req.direction.clone(),
@@ -221,28 +411,39 @@ impl Repository {
         })
     }
 
-    pub async fn update_mapping(
-        &self,
-        id: u32,
-        req: &CreateMappingRequest,
-    ) -> Result<Option<TopicMapping>, sqlx::Error> {
+    pub async fn update_mapping(&self, id: u32, req: &CreateMappingRequest) -> Result<Option<TopicMapping>, sqlx::Error> {
         let direction = match req.direction {
             MappingDirection::MqttToZmq => "mqtt_to_zmq",
             MappingDirection::ZmqToMqtt => "zmq_to_mqtt",
+            MappingDirection::MqttToMqtt => "mqtt_to_mqtt",
+            MappingDirection::ZmqToZmq => "zmq_to_zmq",
             MappingDirection::Bidirectional => "bidirectional",
+        };
+        
+        let source_type = match req.source_endpoint_type {
+            EndpointType::Mqtt => "mqtt",
+            EndpointType::Zmq => "zmq",
+        };
+        
+        let target_type = match req.target_endpoint_type {
+            EndpointType::Mqtt => "mqtt",
+            EndpointType::Zmq => "zmq",
         };
 
         let result = sqlx::query(
             r#"
             UPDATE topic_mappings SET
-                source_topic = ?,
-                target_topic = ?,
-                direction = ?,
-                enabled = ?,
-                description = ?
+                source_endpoint_type = ?, source_endpoint_id = ?,
+                target_endpoint_type = ?, target_endpoint_id = ?,
+                source_topic = ?, target_topic = ?, direction = ?,
+                enabled = ?, description = ?
             WHERE id = ?
             "#,
         )
+        .bind(source_type)
+        .bind(req.source_endpoint_id as i64)
+        .bind(target_type)
+        .bind(req.target_endpoint_id as i64)
         .bind(&req.source_topic)
         .bind(&req.target_topic)
         .bind(direction)
@@ -255,6 +456,10 @@ impl Repository {
         if result.rows_affected() > 0 {
             Ok(Some(TopicMapping {
                 id,
+                source_endpoint_type: req.source_endpoint_type.clone(),
+                source_endpoint_id: req.source_endpoint_id,
+                target_endpoint_type: req.target_endpoint_type.clone(),
+                target_endpoint_id: req.target_endpoint_id,
                 source_topic: req.source_topic.clone(),
                 target_topic: req.target_topic.clone(),
                 direction: req.direction.clone(),
@@ -286,10 +491,10 @@ impl Repository {
             mqtt_sent: row.mqtt_sent as u64,
             zmq_received: row.zmq_received as u64,
             zmq_sent: row.zmq_sent as u64,
-            messages_per_second: 0.0, // Calculated at runtime
-            avg_latency_ms: 0.0,      // Calculated at runtime
+            messages_per_second: 0.0,
+            avg_latency_ms: 0.0,
             error_count: row.error_count as u64,
-            queue_depth: 0, // Runtime value
+            queue_depth: 0,
         })
     }
 

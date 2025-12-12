@@ -32,10 +32,12 @@ pub struct BridgeStatus {
     pub version: String,
 }
 
-/// MQTT connection configuration
+/// MQTT connection configuration - supports multiple brokers
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MqttConfig {
     pub id: Option<u32>,
+    pub name: String,              // Broker name: "Primary", "Backup", etc.
+    pub enabled: bool,             // Whether this broker is active
     pub broker_url: String,
     pub port: u16,
     pub client_id: String,
@@ -49,7 +51,9 @@ pub struct MqttConfig {
 impl Default for MqttConfig {
     fn default() -> Self {
         Self {
-            id: Some(1),
+            id: None,
+            name: "Default".to_string(),
+            enabled: true,
             broker_url: "localhost".to_string(),
             port: 1883,
             client_id: "zeromqtt-bridge".to_string(),
@@ -62,12 +66,45 @@ impl Default for MqttConfig {
     }
 }
 
-/// ZeroMQ connection configuration
+/// Request to create/update MQTT config
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateMqttConfigRequest {
+    pub name: String,
+    pub enabled: bool,
+    pub broker_url: String,
+    pub port: u16,
+    pub client_id: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub use_tls: bool,
+    pub keep_alive_seconds: u16,
+    pub clean_session: bool,
+}
+
+/// ZeroMQ socket type for XPUB/XSUB proxy pattern
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ZmqSocketType {
+    /// XPUB socket - binds and receives subscriptions from SUBs
+    #[default]
+    XPub,
+    /// XSUB socket - binds and connects to multiple PUBs
+    XSub,
+    /// Standard PUB socket - connects to XSUB
+    Pub,
+    /// Standard SUB socket - connects to XPUB
+    Sub,
+}
+
+/// ZeroMQ connection configuration - supports XPUB/XSUB proxy pattern
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ZmqConfig {
     pub id: Option<u32>,
-    pub pub_endpoint: String,
-    pub sub_endpoint: String,
+    pub name: String,                       // Config name: "Proxy", "Publisher", etc.
+    pub enabled: bool,
+    pub socket_type: ZmqSocketType,
+    pub bind_endpoint: Option<String>,      // For XPUB/XSUB: bind address
+    pub connect_endpoints: Vec<String>,     // For PUB/SUB: connect addresses
     pub high_water_mark: u32,
     pub reconnect_interval_ms: u32,
 }
@@ -75,28 +112,57 @@ pub struct ZmqConfig {
 impl Default for ZmqConfig {
     fn default() -> Self {
         Self {
-            id: Some(1),
-            pub_endpoint: "tcp://*:5555".to_string(),
-            sub_endpoint: "tcp://*:5556".to_string(),
+            id: None,
+            name: "Default".to_string(),
+            enabled: true,
+            socket_type: ZmqSocketType::XPub,
+            bind_endpoint: Some("tcp://*:5555".to_string()),
+            connect_endpoints: vec![],
             high_water_mark: 1000,
             reconnect_interval_ms: 1000,
         }
     }
 }
 
-/// Topic mapping direction
+/// Request to create/update ZMQ config
+#[derive(Debug, Clone, Deserialize)]
+pub struct CreateZmqConfigRequest {
+    pub name: String,
+    pub enabled: bool,
+    pub socket_type: ZmqSocketType,
+    pub bind_endpoint: Option<String>,
+    pub connect_endpoints: Vec<String>,
+    pub high_water_mark: u32,
+    pub reconnect_interval_ms: u32,
+}
+
+/// Endpoint type for topic mapping
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum EndpointType {
+    Mqtt,
+    Zmq,
+}
+
+/// Topic mapping direction - now supports intra-protocol forwarding
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum MappingDirection {
     MqttToZmq,
     ZmqToMqtt,
+    MqttToMqtt,      // Forward between MQTT brokers
+    ZmqToZmq,        // Forward between ZMQ endpoints
     Bidirectional,
 }
 
-/// Topic mapping rule
+/// Topic mapping rule - enhanced with endpoint references
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TopicMapping {
     pub id: u32,
+    pub source_endpoint_type: EndpointType,
+    pub source_endpoint_id: u32,           // References mqtt_configs or zmq_configs
+    pub target_endpoint_type: EndpointType,
+    pub target_endpoint_id: u32,
     pub source_topic: String,
     pub target_topic: String,
     pub direction: MappingDirection,
@@ -107,6 +173,10 @@ pub struct TopicMapping {
 /// Request to create a new topic mapping
 #[derive(Debug, Deserialize)]
 pub struct CreateMappingRequest {
+    pub source_endpoint_type: EndpointType,
+    pub source_endpoint_id: u32,
+    pub target_endpoint_type: EndpointType,
+    pub target_endpoint_id: u32,
     pub source_topic: String,
     pub target_topic: String,
     pub direction: MappingDirection,

@@ -1,7 +1,7 @@
-//! Bridge worker - handles message forwarding in a dedicated thread
+//! Bridge worker - handles message forwarding with XPUB/XSUB proxy and multi-broker support
 
 use crate::db::Repository;
-use crate::models::{MqttConfig, ZmqConfig, TopicMapping, MappingDirection};
+use crate::models::{MqttConfig, ZmqConfig, TopicMapping, ZmqSocketType, EndpointType};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 #[derive(Debug, Clone)]
 pub struct ForwardMessage {
     pub source: MessageSource,
+    pub source_id: u32,
     pub topic: String,
     pub payload: Vec<u8>,
 }
@@ -25,8 +26,8 @@ pub enum MessageSource {
 /// Bridge worker that runs MQTT and ZMQ clients in dedicated threads
 pub struct BridgeWorker {
     running: Arc<AtomicBool>,
-    mqtt_thread: Option<JoinHandle<()>>,
-    zmq_thread: Option<JoinHandle<()>>,
+    mqtt_threads: Vec<JoinHandle<()>>,
+    zmq_threads: Vec<JoinHandle<()>>,
     forward_tx: Option<mpsc::Sender<ForwardMessage>>,
 }
 
@@ -34,17 +35,17 @@ impl BridgeWorker {
     pub fn new() -> Self {
         Self {
             running: Arc::new(AtomicBool::new(false)),
-            mqtt_thread: None,
-            zmq_thread: None,
+            mqtt_threads: vec![],
+            zmq_threads: vec![],
             forward_tx: None,
         }
     }
 
-    /// Start the bridge worker with given configurations
-    pub fn start(
+    /// Start the bridge worker with extended multi-config support
+    pub fn start_extended(
         &mut self,
-        mqtt_config: MqttConfig,
-        zmq_config: ZmqConfig,
+        mqtt_configs: Vec<MqttConfig>,
+        zmq_configs: Vec<ZmqConfig>,
         mappings: Vec<TopicMapping>,
         repo: Repository,
     ) -> Result<(), anyhow::Error> {
@@ -56,84 +57,108 @@ impl BridgeWorker {
 
         // Create channels for message forwarding
         let (forward_tx, mut forward_rx) = mpsc::channel::<ForwardMessage>(1000);
-        let (mqtt_cmd_tx, mqtt_cmd_rx) = std::sync::mpsc::channel::<MqttCommand>();
-        let (zmq_cmd_tx, zmq_cmd_rx) = std::sync::mpsc::channel::<ZmqCommand>();
+        
+        // Command channels for each endpoint
+        let mut mqtt_cmd_txs: std::collections::HashMap<u32, std::sync::mpsc::Sender<MqttCommand>> = std::collections::HashMap::new();
+        let mut zmq_cmd_txs: std::collections::HashMap<u32, std::sync::mpsc::Sender<ZmqCommand>> = std::collections::HashMap::new();
 
         self.forward_tx = Some(forward_tx.clone());
 
-        // Clone mappings for each direction
-        let mqtt_to_zmq_mappings: Vec<_> = mappings
-            .iter()
-            .filter(|m| m.enabled && (m.direction == MappingDirection::MqttToZmq || m.direction == MappingDirection::Bidirectional))
-            .cloned()
-            .collect();
+        // Start MQTT threads for each enabled broker
+        for config in mqtt_configs.iter().filter(|c| c.enabled) {
+            let (mqtt_cmd_tx, mqtt_cmd_rx) = std::sync::mpsc::channel::<MqttCommand>();
+            let config_id = config.id.unwrap_or(0);
+            mqtt_cmd_txs.insert(config_id, mqtt_cmd_tx);
+            
+            // Get topics this broker should subscribe to
+            let subscribe_topics: Vec<String> = mappings
+                .iter()
+                .filter(|m| m.enabled && m.source_endpoint_type == EndpointType::Mqtt && m.source_endpoint_id == config_id)
+                .map(|m| m.source_topic.clone())
+                .collect();
 
-        let zmq_to_mqtt_mappings: Vec<_> = mappings
-            .iter()
-            .filter(|m| m.enabled && (m.direction == MappingDirection::ZmqToMqtt || m.direction == MappingDirection::Bidirectional))
-            .cloned()
-            .collect();
+            let running_mqtt = self.running.clone();
+            let forward_tx_mqtt = forward_tx.clone();
+            let config_clone = config.clone();
 
-        // MQTT subscribe topics
-        let mqtt_subscribe_topics: Vec<String> = mqtt_to_zmq_mappings
-            .iter()
-            .map(|m| m.source_topic.clone())
-            .collect();
+            let mqtt_thread = thread::spawn(move || {
+                run_mqtt_worker(
+                    running_mqtt,
+                    config_clone,
+                    subscribe_topics,
+                    forward_tx_mqtt,
+                    mqtt_cmd_rx,
+                );
+            });
 
-        // Start MQTT thread
-        let running_mqtt = self.running.clone();
-        let forward_tx_mqtt = forward_tx.clone();
-        let mqtt_config_clone = mqtt_config.clone();
+            self.mqtt_threads.push(mqtt_thread);
+        }
 
-        let mqtt_thread = thread::spawn(move || {
-            run_mqtt_worker(
-                running_mqtt,
-                mqtt_config_clone,
-                mqtt_subscribe_topics,
-                forward_tx_mqtt,
-                mqtt_cmd_rx,
-            );
-        });
+        // Start ZMQ threads for each enabled config (XPUB/XSUB pattern)
+        for config in zmq_configs.iter().filter(|c| c.enabled) {
+            let (zmq_cmd_tx, zmq_cmd_rx) = std::sync::mpsc::channel::<ZmqCommand>();
+            let config_id = config.id.unwrap_or(0);
+            zmq_cmd_txs.insert(config_id, zmq_cmd_tx);
 
-        // Start ZMQ thread
-        let running_zmq = self.running.clone();
-        let zmq_config_clone = zmq_config.clone();
+            let running_zmq = self.running.clone();
+            let forward_tx_zmq = forward_tx.clone();
+            let config_clone = config.clone();
 
-        let zmq_thread = thread::spawn(move || {
-            run_zmq_worker(
-                running_zmq,
-                zmq_config_clone,
-                forward_tx.clone(),
-                zmq_cmd_rx,
-            );
-        });
+            let zmq_thread = thread::spawn(move || {
+                run_zmq_worker(
+                    running_zmq,
+                    config_clone,
+                    forward_tx_zmq,
+                    zmq_cmd_rx,
+                );
+            });
 
-        self.mqtt_thread = Some(mqtt_thread);
-        self.zmq_thread = Some(zmq_thread);
+            self.zmq_threads.push(zmq_thread);
+        }
 
         // Start forwarding task
         let running_fwd = self.running.clone();
         let repo_fwd = repo.clone();
+        let mappings_fwd = mappings.clone();
 
         tokio::spawn(async move {
             while running_fwd.load(Ordering::SeqCst) {
                 tokio::select! {
                     Some(msg) = forward_rx.recv() => {
-                        match msg.source {
-                            MessageSource::Mqtt => {
-                                // Forward MQTT -> ZMQ
-                                if let Some(target) = find_target_topic(&msg.topic, &mqtt_to_zmq_mappings) {
-                                    debug!("Forwarding MQTT->ZMQ: {} -> {}", msg.topic, target);
-                                    let _ = zmq_cmd_tx.send(ZmqCommand::Publish(target, msg.payload));
-                                    let _ = repo_fwd.increment_stats(1, 0, 0, 1, 0).await;
+                        // Find matching mappings
+                        for mapping in mappings_fwd.iter().filter(|m| m.enabled) {
+                            // Check if source matches
+                            let source_matches = match msg.source {
+                                MessageSource::Mqtt => {
+                                    mapping.source_endpoint_type == EndpointType::Mqtt
+                                        && mapping.source_endpoint_id == msg.source_id
+                                        && matches_topic_pattern(&mapping.source_topic, &msg.topic)
                                 }
-                            }
-                            MessageSource::Zmq => {
-                                // Forward ZMQ -> MQTT
-                                if let Some(target) = find_target_topic(&msg.topic, &zmq_to_mqtt_mappings) {
-                                    debug!("Forwarding ZMQ->MQTT: {} -> {}", msg.topic, target);
-                                    let _ = mqtt_cmd_tx.send(MqttCommand::Publish(target, msg.payload));
-                                    let _ = repo_fwd.increment_stats(0, 1, 1, 0, 0).await;
+                                MessageSource::Zmq => {
+                                    mapping.source_endpoint_type == EndpointType::Zmq
+                                        && mapping.source_endpoint_id == msg.source_id
+                                        && matches_topic_pattern(&mapping.source_topic, &msg.topic)
+                                }
+                            };
+
+                            if source_matches {
+                                let target_topic = apply_mapping(&mapping.source_topic, &mapping.target_topic, &msg.topic);
+                                
+                                match mapping.target_endpoint_type {
+                                    EndpointType::Mqtt => {
+                                        if let Some(tx) = mqtt_cmd_txs.get(&mapping.target_endpoint_id) {
+                                            debug!("Forwarding to MQTT {}: {}", mapping.target_endpoint_id, target_topic);
+                                            let _ = tx.send(MqttCommand::Publish(target_topic, msg.payload.clone()));
+                                            let _ = repo_fwd.increment_stats(0, 1, 0, 0, 0).await;
+                                        }
+                                    }
+                                    EndpointType::Zmq => {
+                                        if let Some(tx) = zmq_cmd_txs.get(&mapping.target_endpoint_id) {
+                                            debug!("Forwarding to ZMQ {}: {}", mapping.target_endpoint_id, target_topic);
+                                            let _ = tx.send(ZmqCommand::Publish(target_topic, msg.payload.clone()));
+                                            let _ = repo_fwd.increment_stats(0, 0, 0, 1, 0).await;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -145,7 +170,9 @@ impl BridgeWorker {
             }
         });
 
-        info!("Bridge worker started");
+        info!("Bridge worker started with {} MQTT brokers and {} ZMQ endpoints", 
+              mqtt_configs.iter().filter(|c| c.enabled).count(),
+              zmq_configs.iter().filter(|c| c.enabled).count());
         Ok(())
     }
 
@@ -154,10 +181,10 @@ impl BridgeWorker {
         self.running.store(false, Ordering::SeqCst);
         
         // Wait for threads to finish
-        if let Some(handle) = self.mqtt_thread.take() {
+        for handle in self.mqtt_threads.drain(..) {
             let _ = handle.join();
         }
-        if let Some(handle) = self.zmq_thread.take() {
+        for handle in self.zmq_threads.drain(..) {
             let _ = handle.join();
         }
         
@@ -202,6 +229,7 @@ fn run_mqtt_worker(
     use paho_mqtt::{AsyncClient, ConnectOptionsBuilder, CreateOptionsBuilder, Message};
     use std::time::Duration;
 
+    let config_id = config.id.unwrap_or(0);
     let server_uri = if config.use_tls {
         format!("ssl://{}:{}", config.broker_url, config.port)
     } else {
@@ -216,18 +244,17 @@ fn run_mqtt_worker(
     let mut client = match AsyncClient::new(create_opts) {
         Ok(c) => c,
         Err(e) => {
-            error!("Failed to create MQTT client: {}", e);
+            error!("[MQTT:{}] Failed to create client: {}", config.name, e);
             return;
         }
     };
 
-    // Create a runtime for this thread
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build() {
         Ok(rt) => rt,
         Err(e) => {
-            error!("Failed to create tokio runtime: {}", e);
+            error!("[MQTT:{}] Failed to create tokio runtime: {}", config.name, e);
             return;
         }
     };
@@ -249,49 +276,47 @@ fn run_mqtt_worker(
         let conn_opts = conn_opts.finalize();
 
         if let Err(e) = client.connect(conn_opts).await {
-            error!("Failed to connect to MQTT broker: {}", e);
+            error!("[MQTT:{}] Failed to connect: {}", config.name, e);
             return;
         }
 
-        info!("Connected to MQTT broker: {}:{}", config.broker_url, config.port);
+        info!("[MQTT:{}] Connected to {}:{}", config.name, config.broker_url, config.port);
 
         // Subscribe to topics
         if !subscribe_topics.is_empty() {
             let qos: Vec<i32> = subscribe_topics.iter().map(|_| 1).collect();
             let topics_ref: Vec<&str> = subscribe_topics.iter().map(|s| s.as_str()).collect();
             if let Err(e) = client.subscribe_many(&topics_ref, &qos).await {
-                error!("Failed to subscribe to MQTT topics: {}", e);
+                error!("[MQTT:{}] Failed to subscribe: {}", config.name, e);
             } else {
-                info!("Subscribed to MQTT topics: {:?}", subscribe_topics);
+                info!("[MQTT:{}] Subscribed to {:?}", config.name, subscribe_topics);
             }
         }
 
-        // Get message stream
         let stream = client.get_stream(100);
 
         while running.load(Ordering::SeqCst) {
-            // Check for incoming messages
             tokio::select! {
                 msg_opt = async { stream.recv().await.ok().flatten() } => {
                     if let Some(msg) = msg_opt {
                         let fwd_msg = ForwardMessage {
                             source: MessageSource::Mqtt,
+                            source_id: config_id,
                             topic: msg.topic().to_string(),
                             payload: msg.payload().to_vec(),
                         };
                         if let Err(e) = forward_tx.send(fwd_msg).await {
-                            error!("Failed to forward MQTT message: {}", e);
+                            error!("[MQTT:{}] Failed to forward: {}", config.name, e);
                         }
                     }
                 }
                 _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                    // Check for commands
                     while let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
                             MqttCommand::Publish(topic, payload) => {
                                 let msg = Message::new(&topic, payload, 1);
                                 if let Err(e) = client.publish(msg).await {
-                                    error!("Failed to publish MQTT message: {}", e);
+                                    error!("[MQTT:{}] Failed to publish: {}", config.name, e);
                                 }
                             }
                         }
@@ -301,7 +326,7 @@ fn run_mqtt_worker(
         }
 
         let _ = client.disconnect(None).await;
-        info!("MQTT worker stopped");
+        info!("[MQTT:{}] Disconnected", config.name);
     });
 }
 
@@ -313,111 +338,141 @@ fn run_zmq_worker(
 ) {
     use zmq::{Context, SocketType};
 
+    let config_id = config.id.unwrap_or(0);
     let context = Context::new();
 
-    // Create PUB socket
-    let pub_socket = match context.socket(SocketType::PUB) {
+    // Create socket based on type
+    let socket_type = match config.socket_type {
+        ZmqSocketType::XPub => SocketType::XPUB,
+        ZmqSocketType::XSub => SocketType::XSUB,
+        ZmqSocketType::Pub => SocketType::PUB,
+        ZmqSocketType::Sub => SocketType::SUB,
+    };
+
+    let socket = match context.socket(socket_type) {
         Ok(s) => s,
         Err(e) => {
-            error!("Failed to create ZMQ PUB socket: {}", e);
+            error!("[ZMQ:{}] Failed to create socket: {}", config.name, e);
             return;
         }
     };
 
-    if let Err(e) = pub_socket.bind(&config.pub_endpoint) {
-        error!("Failed to bind ZMQ PUB socket: {}", e);
-        return;
-    }
-    let _ = pub_socket.set_sndhwm(config.high_water_mark as i32);
-    info!("ZMQ PUB socket bound to: {}", config.pub_endpoint);
+    let _ = socket.set_sndhwm(config.high_water_mark as i32);
+    let _ = socket.set_rcvhwm(config.high_water_mark as i32);
 
-    // Create SUB socket
-    let sub_socket = match context.socket(SocketType::SUB) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to create ZMQ SUB socket: {}", e);
-            return;
+    // Bind or connect based on socket type
+    match config.socket_type {
+        ZmqSocketType::XPub | ZmqSocketType::XSub => {
+            // Bind for proxy sockets
+            if let Some(ref endpoint) = config.bind_endpoint {
+                if let Err(e) = socket.bind(endpoint) {
+                    error!("[ZMQ:{}] Failed to bind: {}", config.name, e);
+                    return;
+                }
+                info!("[ZMQ:{}] Bound to {}", config.name, endpoint);
+            }
+            
+            // XSUB needs to subscribe to all
+            if config.socket_type == ZmqSocketType::XSub {
+                let _ = socket.set_subscribe(b"");
+                
+                // Also connect to external publishers
+                for endpoint in &config.connect_endpoints {
+                    if let Err(e) = socket.connect(endpoint) {
+                        warn!("[ZMQ:{}] Failed to connect to {}: {}", config.name, endpoint, e);
+                    } else {
+                        info!("[ZMQ:{}] Connected to {}", config.name, endpoint);
+                    }
+                }
+            }
         }
-    };
-
-    if let Err(e) = sub_socket.connect(&config.sub_endpoint) {
-        error!("Failed to connect ZMQ SUB socket: {}", e);
-        return;
+        ZmqSocketType::Pub => {
+            // Bind for publishing
+            if let Some(ref endpoint) = config.bind_endpoint {
+                if let Err(e) = socket.bind(endpoint) {
+                    error!("[ZMQ:{}] Failed to bind: {}", config.name, e);
+                    return;
+                }
+                info!("[ZMQ:{}] PUB bound to {}", config.name, endpoint);
+            }
+        }
+        ZmqSocketType::Sub => {
+            // Connect to publishers
+            let _ = socket.set_subscribe(b"");
+            for endpoint in &config.connect_endpoints {
+                if let Err(e) = socket.connect(endpoint) {
+                    warn!("[ZMQ:{}] Failed to connect to {}: {}", config.name, endpoint, e);
+                } else {
+                    info!("[ZMQ:{}] SUB connected to {}", config.name, endpoint);
+                }
+            }
+        }
     }
-    let _ = sub_socket.set_subscribe(b"");
-    let _ = sub_socket.set_rcvhwm(config.high_water_mark as i32);
-    let _ = sub_socket.set_rcvtimeo(100); // 100ms timeout
-    info!("ZMQ SUB socket connected to: {}", config.sub_endpoint);
 
-    // Create a runtime for sending to async channel
+    let _ = socket.set_rcvtimeo(100); // 100ms timeout
+
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build() {
         Ok(rt) => rt,
         Err(e) => {
-            error!("Failed to create tokio runtime: {}", e);
+            error!("[ZMQ:{}] Failed to create tokio runtime: {}", config.name, e);
             return;
         }
     };
 
     while running.load(Ordering::SeqCst) {
-        // Receive from SUB socket
-        match sub_socket.recv_bytes(0) {
-            Ok(data) => {
-                // Parse topic and payload (space-separated)
-                if let Some(sep_pos) = data.iter().position(|&b| b == b' ') {
-                    let topic = String::from_utf8_lossy(&data[..sep_pos]).to_string();
-                    let payload = data[sep_pos + 1..].to_vec();
+        // Receive from socket (for XSUB, SUB types)
+        if matches!(config.socket_type, ZmqSocketType::XSub | ZmqSocketType::Sub) {
+            match socket.recv_bytes(0) {
+                Ok(data) => {
+                    if let Some(sep_pos) = data.iter().position(|&b| b == b' ') {
+                        let topic = String::from_utf8_lossy(&data[..sep_pos]).to_string();
+                        let payload = data[sep_pos + 1..].to_vec();
 
-                    let fwd_msg = ForwardMessage {
-                        source: MessageSource::Zmq,
-                        topic,
-                        payload,
-                    };
+                        let fwd_msg = ForwardMessage {
+                            source: MessageSource::Zmq,
+                            source_id: config_id,
+                            topic,
+                            payload,
+                        };
 
-                    rt.block_on(async {
-                        if let Err(e) = forward_tx.send(fwd_msg).await {
-                            error!("Failed to forward ZMQ message: {}", e);
-                        }
-                    });
+                        rt.block_on(async {
+                            if let Err(e) = forward_tx.send(fwd_msg).await {
+                                error!("[ZMQ:{}] Failed to forward: {}", config.name, e);
+                            }
+                        });
+                    }
                 }
-            }
-            Err(zmq::Error::EAGAIN) => {
-                // Timeout, no message
-            }
-            Err(e) => {
-                if running.load(Ordering::SeqCst) {
-                    warn!("ZMQ receive error: {}", e);
+                Err(zmq::Error::EAGAIN) => {
+                    // Timeout, no message
+                }
+                Err(e) => {
+                    if running.load(Ordering::SeqCst) {
+                        warn!("[ZMQ:{}] Receive error: {}", config.name, e);
+                    }
                 }
             }
         }
 
-        // Check for commands
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                ZmqCommand::Publish(topic, payload) => {
-                    let mut message = topic.as_bytes().to_vec();
-                    message.push(b' ');
-                    message.extend_from_slice(&payload);
-                    if let Err(e) = pub_socket.send(&message, 0) {
-                        error!("Failed to send ZMQ message: {}", e);
+        // Check for commands (for XPUB, PUB types)
+        if matches!(config.socket_type, ZmqSocketType::XPub | ZmqSocketType::Pub) {
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    ZmqCommand::Publish(topic, payload) => {
+                        let mut message = topic.as_bytes().to_vec();
+                        message.push(b' ');
+                        message.extend_from_slice(&payload);
+                        if let Err(e) = socket.send(&message, 0) {
+                            error!("[ZMQ:{}] Failed to send: {}", config.name, e);
+                        }
                     }
                 }
             }
         }
     }
 
-    info!("ZMQ worker stopped");
-}
-
-/// Find target topic based on mappings
-fn find_target_topic(source: &str, mappings: &[TopicMapping]) -> Option<String> {
-    for mapping in mappings {
-        if matches_topic_pattern(&mapping.source_topic, source) {
-            return Some(apply_mapping(&mapping.source_topic, &mapping.target_topic, source));
-        }
-    }
-    None
+    info!("[ZMQ:{}] Worker stopped", config.name);
 }
 
 /// Check if topic matches pattern with MQTT wildcards
@@ -451,7 +506,6 @@ fn apply_mapping(pattern: &str, target: &str, source: &str) -> String {
         return target.to_string();
     }
 
-    // Simple replacement for now
     let source_parts: Vec<&str> = source.split('/').collect();
     let target_parts: Vec<&str> = target.split('/').collect();
     

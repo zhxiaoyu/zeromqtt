@@ -1,7 +1,10 @@
-//! Configuration API handlers
+//! Configuration API handlers - Multi-broker and Multi-ZMQ support
 
 use crate::error::{AppError, AppResult};
-use crate::models::{CreateMappingRequest, MqttConfig, TopicMapping, ZmqConfig};
+use crate::models::{
+    CreateMappingRequest, CreateMqttConfigRequest, CreateZmqConfigRequest,
+    MqttConfig, TopicMapping, ZmqConfig,
+};
 use crate::state::AppState;
 use axum::{
     extract::{Path, State},
@@ -9,54 +12,154 @@ use axum::{
     Json, Router,
 };
 
-// ============ MQTT Config ============
+// ============ MQTT Configs (Multiple Brokers) ============
 
-/// Get MQTT configuration
-async fn get_mqtt_config(State(state): State<AppState>) -> AppResult<Json<MqttConfig>> {
+/// Get all MQTT broker configurations
+async fn get_mqtt_configs(State(state): State<AppState>) -> AppResult<Json<Vec<MqttConfig>>> {
+    let configs = state
+        .repo
+        .get_mqtt_configs()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(configs))
+}
+
+/// Get a single MQTT broker configuration by ID
+async fn get_mqtt_config_by_id(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+) -> AppResult<Json<MqttConfig>> {
     let config = state
         .repo
-        .get_mqtt_config()
+        .get_mqtt_config(id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound(format!("MQTT config {} not found", id)))?;
+    Ok(Json(config))
+}
+
+/// Add a new MQTT broker configuration
+async fn add_mqtt_config(
+    State(state): State<AppState>,
+    Json(req): Json<CreateMqttConfigRequest>,
+) -> AppResult<Json<MqttConfig>> {
+    let config = state
+        .repo
+        .add_mqtt_config(&req)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(config))
 }
 
-/// Update MQTT configuration
+/// Update an existing MQTT broker configuration
 async fn update_mqtt_config(
     State(state): State<AppState>,
-    Json(config): Json<MqttConfig>,
+    Path(id): Path<u32>,
+    Json(req): Json<CreateMqttConfigRequest>,
 ) -> AppResult<Json<MqttConfig>> {
-    let updated = state
-        .repo
-        .update_mqtt_config(&config)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Json(updated))
-}
-
-// ============ ZeroMQ Config ============
-
-/// Get ZeroMQ configuration
-async fn get_zmq_config(State(state): State<AppState>) -> AppResult<Json<ZmqConfig>> {
     let config = state
         .repo
-        .get_zmq_config()
+        .update_mqtt_config(id, &req)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound(format!("MQTT config {} not found", id)))?;
+    Ok(Json(config))
+}
+
+/// Delete an MQTT broker configuration
+async fn delete_mqtt_config(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+) -> AppResult<Json<serde_json::Value>> {
+    let deleted = state
+        .repo
+        .delete_mqtt_config(id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if deleted {
+        Ok(Json(serde_json::json!({"deleted": true, "id": id})))
+    } else {
+        Err(AppError::NotFound(format!(
+            "MQTT config with id {} not found",
+            id
+        )))
+    }
+}
+
+// ============ ZeroMQ Configs (XPUB/XSUB) ============
+
+/// Get all ZeroMQ configurations
+async fn get_zmq_configs(State(state): State<AppState>) -> AppResult<Json<Vec<ZmqConfig>>> {
+    let configs = state
+        .repo
+        .get_zmq_configs()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(configs))
+}
+
+/// Get a single ZMQ configuration by ID
+async fn get_zmq_config_by_id(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+) -> AppResult<Json<ZmqConfig>> {
+    let config = state
+        .repo
+        .get_zmq_config(id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound(format!("ZMQ config {} not found", id)))?;
+    Ok(Json(config))
+}
+
+/// Add a new ZMQ configuration
+async fn add_zmq_config(
+    State(state): State<AppState>,
+    Json(req): Json<CreateZmqConfigRequest>,
+) -> AppResult<Json<ZmqConfig>> {
+    let config = state
+        .repo
+        .add_zmq_config(&req)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(config))
 }
 
-/// Update ZeroMQ configuration
+/// Update an existing ZMQ configuration
 async fn update_zmq_config(
     State(state): State<AppState>,
-    Json(config): Json<ZmqConfig>,
+    Path(id): Path<u32>,
+    Json(req): Json<CreateZmqConfigRequest>,
 ) -> AppResult<Json<ZmqConfig>> {
-    let updated = state
+    let config = state
         .repo
-        .update_zmq_config(&config)
+        .update_zmq_config(id, &req)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound(format!("ZMQ config {} not found", id)))?;
+    Ok(Json(config))
+}
+
+/// Delete a ZMQ configuration
+async fn delete_zmq_config(
+    State(state): State<AppState>,
+    Path(id): Path<u32>,
+) -> AppResult<Json<serde_json::Value>> {
+    let deleted = state
+        .repo
+        .delete_zmq_config(id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
-    Ok(Json(updated))
+
+    if deleted {
+        Ok(Json(serde_json::json!({"deleted": true, "id": id})))
+    } else {
+        Err(AppError::NotFound(format!(
+            "ZMQ config with id {} not found",
+            id
+        )))
+    }
 }
 
 // ============ Topic Mappings ============
@@ -133,10 +236,22 @@ async fn delete_mapping(
 /// Create configuration routes
 pub fn config_routes() -> Router<AppState> {
     Router::new()
-        // MQTT config
-        .route("/mqtt", get(get_mqtt_config).put(update_mqtt_config))
-        // ZeroMQ config
-        .route("/zmq", get(get_zmq_config).put(update_zmq_config))
+        // MQTT configs (multiple brokers)
+        .route("/mqtt", get(get_mqtt_configs).post(add_mqtt_config))
+        .route(
+            "/mqtt/{id}",
+            get(get_mqtt_config_by_id)
+                .put(update_mqtt_config)
+                .delete(delete_mqtt_config),
+        )
+        // ZeroMQ configs (XPUB/XSUB)
+        .route("/zmq", get(get_zmq_configs).post(add_zmq_config))
+        .route(
+            "/zmq/{id}",
+            get(get_zmq_config_by_id)
+                .put(update_zmq_config)
+                .delete(delete_zmq_config),
+        )
         // Topic mappings
         .route("/mappings", get(get_mappings).post(add_mapping))
         .route(
