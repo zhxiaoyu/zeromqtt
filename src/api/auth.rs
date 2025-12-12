@@ -1,27 +1,32 @@
 //! Authentication API handlers
 
 use crate::auth::{encode_token, validate_credentials, AuthUser};
-use crate::config::AppConfig;
 use crate::error::{AppError, AppResult};
 use crate::models::{LoginRequest, LoginResponse, MeResponse};
-use axum::{extract::State, routing::{get, post}, Json, Router};
-use std::sync::Arc;
+use crate::state::AppState;
+use axum::{
+    extract::State,
+    routing::{get, post},
+    Json, Router,
+};
 
 /// Login handler
 async fn login(
-    State(config): State<Arc<AppConfig>>,
+    State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> AppResult<Json<LoginResponse>> {
-    if !validate_credentials(&req.username, &req.password, &config) {
-        return Err(AppError::AuthError("Invalid username or password".to_string()));
+    if !validate_credentials(&req.username, &req.password, &state.config) {
+        return Err(AppError::AuthError(
+            "Invalid username or password".to_string(),
+        ));
     }
 
-    let token = encode_token(&req.username, &config)?;
+    let token = encode_token(&req.username, &state.config)?;
 
     Ok(Json(LoginResponse {
         token,
         token_type: "Bearer".to_string(),
-        expires_in: config.jwt.expiration_hours * 3600,
+        expires_in: state.config.jwt.expiration_hours * 3600,
     }))
 }
 
@@ -33,9 +38,8 @@ async fn me(AuthUser(user): AuthUser) -> Json<MeResponse> {
 }
 
 /// Create authentication routes
-pub fn auth_routes(config: Arc<AppConfig>) -> Router {
+pub fn auth_routes() -> Router<AppState> {
     Router::new()
         .route("/login", post(login))
         .route("/me", get(me))
-        .with_state(config)
 }
