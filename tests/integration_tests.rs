@@ -1,10 +1,6 @@
 //! Integration tests for the ZeroMQTT bridge
 
-use std::time::Duration;
-use tokio::time::sleep;
-
 mod bridge_tests {
-    use super::*;
     use zeromqtt::bridge::*;
     use zeromqtt::models::*;
 
@@ -124,7 +120,6 @@ mod bridge_tests {
 }
 
 mod worker_tests {
-    use super::*;
     use zeromqtt::bridge::worker::*;
     
     #[test]
@@ -155,12 +150,9 @@ mod worker_tests {
 }
 
 mod repository_tests {
-    use super::*;
-    
     #[tokio::test]
     async fn test_database_initialization() {
-        use zeromqtt::db::*;
-        
+        // Test database connection and table creation
         // Create a temporary database for testing
         let temp_dir = std::env::temp_dir();
         let db_path = temp_dir.join("zeromqtt_test.db");
@@ -196,7 +188,7 @@ mod repository_tests {
 /// Run with: cargo test e2e_bridge -- --ignored --nocapture
 mod e2e_bridge_tests {
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use std::thread;
 

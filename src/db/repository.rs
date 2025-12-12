@@ -1,7 +1,7 @@
 //! Repository implementations for database access
 
 use crate::models::{
-    BridgeState, BridgeStatus, ConnectionStatus, CreateMappingRequest, MappingDirection,
+    CreateMappingRequest, MappingDirection,
     MessageStats, MqttConfig, TopicMapping, ZmqConfig,
 };
 use sqlx::sqlite::SqlitePool;
@@ -88,6 +88,7 @@ impl From<TopicMappingRow> for TopicMapping {
 }
 
 #[derive(FromRow)]
+#[allow(dead_code)]
 struct MessageStatsRow {
     mqtt_received: i64,
     mqtt_sent: i64,

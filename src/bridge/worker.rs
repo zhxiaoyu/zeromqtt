@@ -170,6 +170,12 @@ impl BridgeWorker {
     }
 }
 
+impl Default for BridgeWorker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for BridgeWorker {
     fn drop(&mut self) {
         self.stop();
@@ -202,12 +208,10 @@ fn run_mqtt_worker(
         format!("tcp://{}:{}", config.broker_url, config.port)
     };
 
-    let create_opts = match CreateOptionsBuilder::new()
+    let create_opts = CreateOptionsBuilder::new()
         .server_uri(&server_uri)
         .client_id(&config.client_id)
-        .finalize() {
-            opts => opts,
-    };
+        .finalize();
 
     let mut client = match AsyncClient::new(create_opts) {
         Ok(c) => c,

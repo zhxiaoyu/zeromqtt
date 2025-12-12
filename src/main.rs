@@ -3,7 +3,6 @@
 //! This is the main entry point for the ZeroMQTT bridge with web management.
 
 use axum::Router;
-use std::sync::Arc;
 use tokio::net::TcpListener;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info;

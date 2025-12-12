@@ -1,0 +1,27 @@
+[Unit]
+Description=ZeroMQTT Bridge Service
+Documentation=https://github.com/yourusername/zeromqtt
+After=network.target
+
+[Service]
+Type=simple
+User=zeromqtt
+Group=zeromqtt
+ExecStart=/usr/bin/zeromqtt
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/zeromqtt
+
+# Environment
+Environment=RUST_LOG=info
+Environment=ZEROMQTT_PORT=3000
+
+[Install]
+WantedBy=multi-user.target

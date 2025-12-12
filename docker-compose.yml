@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  zeromqtt:
+    build: .
+    container_name: zeromqtt
+    ports:
+      - "3000:3000"       # Web UI and API
+      - "5555:5555"       # ZMQ PUB
+      - "5556:5556"       # ZMQ SUB
+    environment:
+      - RUST_LOG=info
+      - ZEROMQTT_PORT=3000
+    volumes:
+      - zeromqtt-data:/root/.zeromqtt
+    depends_on:
+      - mosquitto
+    restart: unless-stopped
+
+  # Optional: MQTT Broker for testing
+  mosquitto:
+    image: eclipse-mosquitto:2
+    container_name: mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - mosquitto-data:/mosquitto/data
+      - mosquitto-logs:/mosquitto/log
+    command: mosquitto -c /mosquitto-no-auth.conf
+    restart: unless-stopped
+
+  # Optional: Prometheus for metrics
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+
+volumes:
+  zeromqtt-data:
+  mosquitto-data:
+  mosquitto-logs:
+  prometheus-data:

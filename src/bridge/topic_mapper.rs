@@ -133,7 +133,7 @@ fn apply_topic_mapping(pattern: &str, target: &str, source: &str) -> String {
     // For now, simple replacement - can be enhanced for complex mappings
     // If pattern has wildcards, we extract matched parts and substitute
 
-    let pattern_parts: Vec<&str> = pattern.split('/').collect();
+    let _pattern_parts: Vec<&str> = pattern.split('/').collect();
     let source_parts: Vec<&str> = source.split('/').collect();
     let target_parts: Vec<&str> = target.split('/').collect();
 

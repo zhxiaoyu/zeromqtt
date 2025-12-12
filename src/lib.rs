@@ -14,3 +14,4 @@ pub mod mqtt;
 pub mod zeromq;
 pub mod bridge;
 pub mod state;
+pub mod telemetry;

@@ -204,12 +204,13 @@ impl MockBridgeStore {
     }
 }
 
-lazy_static::lazy_static! {
-    /// Global mock store instance
-    pub static ref MOCK_STORE: Arc<MockBridgeStore> = Arc::new(MockBridgeStore::new());
-}
+use std::sync::OnceLock;
+
+/// Global mock store instance
+static MOCK_STORE: OnceLock<Arc<MockBridgeStore>> = OnceLock::new();
 
 /// Get the global mock store
 pub fn get_mock_store() -> Arc<MockBridgeStore> {
-    MOCK_STORE.clone()
+    MOCK_STORE.get_or_init(|| Arc::new(MockBridgeStore::new())).clone()
 }
+
