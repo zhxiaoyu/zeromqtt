@@ -1,0 +1,37 @@
+[package]
+name = "zeromqtt"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+paho-mqtt = { version = "0.13", features=["vendored-ssl"] }
+vite-rs = { git = "https://github.com/zhxiaoyu/vite-rs.git" }
+vite-rs-axum-0-8 = { git = "https://github.com/zhxiaoyu/vite-rs.git" }
+zmq = "0.10.0"
+tokio = { version = "1.48.0", features = ["full"] }
+axum = "0.8.7"
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Authentication
+jsonwebtoken = "9"
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP utilities
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+tower = "0.5"
+
+# Error handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Async utilities
+async-trait = "0.1"
+
+# Random for mock data
+rand = "0.8"
+
+# Global state
+lazy_static = "1.4"
