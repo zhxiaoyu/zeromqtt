@@ -2,8 +2,8 @@
 //! Now supports multiple MQTT brokers and XPUB/XSUB proxy pattern
 
 use crate::db::Repository;
-use crate::models::{BridgeState, BridgeStatus, ConnectionStatus};
-use crate::bridge::{TopicMapper, BridgeWorker};
+use crate::models::{BridgeState, BridgeStatus, ConnectionStatus, TopicMapping};
+use crate::bridge::BridgeWorker;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use parking_lot::Mutex;
@@ -14,7 +14,8 @@ use tracing::info;
 pub struct BridgeCore {
     state: Arc<RwLock<BridgeState>>,
     repo: Repository,
-    topic_mapper: Arc<RwLock<TopicMapper>>,
+    /// Shared mappings cache - updated on add/update/delete, used by worker
+    mappings_cache: Arc<RwLock<Vec<TopicMapping>>>,
     worker: Arc<Mutex<BridgeWorker>>,
 }
 
@@ -24,7 +25,7 @@ impl BridgeCore {
         Self {
             state: Arc::new(RwLock::new(BridgeState::Stopped)),
             repo,
-            topic_mapper: Arc::new(RwLock::new(TopicMapper::new(vec![]))),
+            mappings_cache: Arc::new(RwLock::new(vec![])),
             worker: Arc::new(Mutex::new(BridgeWorker::new())),
         }
     }
@@ -75,16 +76,21 @@ impl BridgeCore {
         let zmq_configs = self.repo.get_zmq_configs().await?;
         let mappings = self.repo.get_mappings().await?;
 
-        // Update topic mapper
-        *self.topic_mapper.write().await = TopicMapper::new(mappings.clone());
+        // Initialize mappings cache
+        *self.mappings_cache.write().await = mappings;
 
         // Reset stats and record start time
         let _ = self.repo.reset_stats().await;
 
-        // Start the worker with all configs
+        // Start the worker with shared mappings cache
         {
             let mut worker = self.worker.lock();
-            worker.start_extended(mqtt_configs, zmq_configs, mappings, self.repo.clone())?;
+            worker.start_extended(
+                mqtt_configs, 
+                zmq_configs, 
+                self.mappings_cache.clone(), 
+                self.repo.clone()
+            )?;
         }
 
         *self.state.write().await = BridgeState::Running;
@@ -114,11 +120,18 @@ impl BridgeCore {
         self.start().await
     }
 
-    /// Reload topic mappings
+    /// Reload topic mappings from database into cache and update subscriptions
     pub async fn reload_mappings(&self) -> Result<(), anyhow::Error> {
         let mappings = self.repo.get_mappings().await?;
-        *self.topic_mapper.write().await = TopicMapper::new(mappings);
-        info!("Topic mappings reloaded");
+        *self.mappings_cache.write().await = mappings.clone();
+        
+        // Update MQTT subscriptions dynamically
+        {
+            let worker = self.worker.lock();
+            worker.update_subscriptions(&mappings);
+        }
+        
+        info!("Topic mappings reloaded into cache");
         Ok(())
     }
 }

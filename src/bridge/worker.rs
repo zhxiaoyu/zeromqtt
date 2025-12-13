@@ -29,6 +29,8 @@ pub struct BridgeWorker {
     mqtt_threads: Vec<JoinHandle<()>>,
     zmq_threads: Vec<JoinHandle<()>>,
     forward_tx: Option<mpsc::Sender<ForwardMessage>>,
+    /// MQTT command channels for dynamic subscription updates
+    mqtt_cmd_txs: std::collections::HashMap<u32, std::sync::mpsc::Sender<MqttCommand>>,
 }
 
 impl BridgeWorker {
@@ -38,6 +40,7 @@ impl BridgeWorker {
             mqtt_threads: vec![],
             zmq_threads: vec![],
             forward_tx: None,
+            mqtt_cmd_txs: std::collections::HashMap::new(),
         }
     }
 
@@ -46,7 +49,7 @@ impl BridgeWorker {
         &mut self,
         mqtt_configs: Vec<MqttConfig>,
         zmq_configs: Vec<ZmqConfig>,
-        mappings: Vec<TopicMapping>,
+        mappings_cache: Arc<tokio::sync::RwLock<Vec<TopicMapping>>>,
         repo: Repository,
     ) -> Result<(), anyhow::Error> {
         if self.running.load(Ordering::SeqCst) {
@@ -70,12 +73,18 @@ impl BridgeWorker {
             let config_id = config.id.unwrap_or(0);
             mqtt_cmd_txs.insert(config_id, mqtt_cmd_tx);
             
-            // Get topics this broker should subscribe to
-            let subscribe_topics: Vec<String> = mappings
-                .iter()
-                .filter(|m| m.enabled && m.source_endpoint_type == EndpointType::Mqtt && m.source_endpoint_id == config_id)
-                .map(|m| m.source_topic.clone())
-                .collect();
+            // Get initial topics from mappings cache
+            // New topics can be subscribed dynamically via MqttCommand::Subscribe
+            let subscribe_topics: Vec<String> = {
+                if let Ok(guard) = mappings_cache.try_read() {
+                    guard.iter()
+                        .filter(|m| m.enabled && m.source_endpoint_type == EndpointType::Mqtt && m.source_endpoint_id == config_id)
+                        .map(|m| m.source_topic.clone())
+                        .collect()
+                } else {
+                    vec![]
+                }
+            };
 
             let running_mqtt = self.running.clone();
             let forward_tx_mqtt = forward_tx.clone();
@@ -116,10 +125,13 @@ impl BridgeWorker {
             self.zmq_threads.push(zmq_thread);
         }
 
+        // Store MQTT command channels for dynamic subscription updates
+        self.mqtt_cmd_txs = mqtt_cmd_txs.clone();
+
         // Start forwarding task
         let running_fwd = self.running.clone();
         let repo_fwd = repo.clone();
-        let mappings_fwd = mappings.clone();
+        let mappings_cache_fwd = mappings_cache.clone();
 
         tokio::spawn(async move {
             while running_fwd.load(Ordering::SeqCst) {
@@ -127,9 +139,22 @@ impl BridgeWorker {
                     Some(msg) = forward_rx.recv() => {
                         info!("Received message from {:?} id={}: topic={}", msg.source, msg.source_id, msg.topic);
                         
+                        // Track received stats
+                        match msg.source {
+                            MessageSource::Mqtt => {
+                                let _ = repo_fwd.increment_stats(1, 0, 0, 0, 0).await;
+                            }
+                            MessageSource::Zmq => {
+                                let _ = repo_fwd.increment_stats(0, 0, 1, 0, 0).await;
+                            }
+                        }
+                        
+                        // Read mappings from shared cache (fast, in-memory)
+                        let mappings = mappings_cache_fwd.read().await;
+                        
                         let mut matched = false;
                         // Find matching mappings
-                        for mapping in mappings_fwd.iter().filter(|m| m.enabled) {
+                        for mapping in mappings.iter().filter(|m| m.enabled) {
                             // Check if source matches
                             let source_matches = match msg.source {
                                 MessageSource::Mqtt => {
@@ -188,6 +213,26 @@ impl BridgeWorker {
         Ok(())
     }
 
+    /// Update MQTT subscriptions dynamically based on new mappings
+    pub fn update_subscriptions(&self, mappings: &[TopicMapping]) {
+        for (config_id, tx) in &self.mqtt_cmd_txs {
+            // Get topics for this MQTT broker from the mappings
+            let topics: Vec<String> = mappings
+                .iter()
+                .filter(|m| m.enabled && m.source_endpoint_type == EndpointType::Mqtt && m.source_endpoint_id == *config_id)
+                .map(|m| m.source_topic.clone())
+                .collect();
+            
+            if !topics.is_empty() {
+                if let Err(e) = tx.send(MqttCommand::Subscribe(topics.clone())) {
+                    error!("Failed to send subscribe command: {}", e);
+                } else {
+                    info!("Sent subscribe command for topics: {:?}", topics);
+                }
+            }
+        }
+    }
+
     /// Stop the bridge worker
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::SeqCst);
@@ -224,6 +269,7 @@ impl Drop for BridgeWorker {
 // Commands for MQTT thread
 enum MqttCommand {
     Publish(String, Vec<u8>),
+    Subscribe(Vec<String>),
 }
 
 // Commands for ZMQ thread
@@ -329,6 +375,17 @@ fn run_mqtt_worker(
                                 let msg = Message::new(&topic, payload, 1);
                                 if let Err(e) = client.publish(msg).await {
                                     error!("[MQTT:{}] Failed to publish: {}", config.name, e);
+                                }
+                            }
+                            MqttCommand::Subscribe(topics) => {
+                                if !topics.is_empty() {
+                                    let qos: Vec<i32> = topics.iter().map(|_| 1).collect();
+                                    let topics_ref: Vec<&str> = topics.iter().map(|s| s.as_str()).collect();
+                                    if let Err(e) = client.subscribe_many(&topics_ref, &qos).await {
+                                        error!("[MQTT:{}] Failed to subscribe: {}", config.name, e);
+                                    } else {
+                                        info!("[MQTT:{}] Dynamically subscribed to {:?}", config.name, topics);
+                                    }
                                 }
                             }
                         }
