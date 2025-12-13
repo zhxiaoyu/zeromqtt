@@ -125,6 +125,9 @@ impl BridgeWorker {
             while running_fwd.load(Ordering::SeqCst) {
                 tokio::select! {
                     Some(msg) = forward_rx.recv() => {
+                        info!("Received message from {:?} id={}: topic={}", msg.source, msg.source_id, msg.topic);
+                        
+                        let mut matched = false;
                         // Find matching mappings
                         for mapping in mappings_fwd.iter().filter(|m| m.enabled) {
                             // Check if source matches
@@ -142,25 +145,34 @@ impl BridgeWorker {
                             };
 
                             if source_matches {
+                                matched = true;
                                 let target_topic = apply_mapping(&mapping.source_topic, &mapping.target_topic, &msg.topic);
                                 
                                 match mapping.target_endpoint_type {
                                     EndpointType::Mqtt => {
                                         if let Some(tx) = mqtt_cmd_txs.get(&mapping.target_endpoint_id) {
-                                            debug!("Forwarding to MQTT {}: {}", mapping.target_endpoint_id, target_topic);
+                                            info!("Forwarding to MQTT endpoint {}: {}", mapping.target_endpoint_id, target_topic);
                                             let _ = tx.send(MqttCommand::Publish(target_topic, msg.payload.clone()));
                                             let _ = repo_fwd.increment_stats(0, 1, 0, 0, 0).await;
+                                        } else {
+                                            warn!("MQTT endpoint {} not found!", mapping.target_endpoint_id);
                                         }
                                     }
                                     EndpointType::Zmq => {
                                         if let Some(tx) = zmq_cmd_txs.get(&mapping.target_endpoint_id) {
-                                            debug!("Forwarding to ZMQ {}: {}", mapping.target_endpoint_id, target_topic);
+                                            info!("Forwarding to ZMQ endpoint {}: {}", mapping.target_endpoint_id, target_topic);
                                             let _ = tx.send(ZmqCommand::Publish(target_topic, msg.payload.clone()));
                                             let _ = repo_fwd.increment_stats(0, 0, 0, 1, 0).await;
+                                        } else {
+                                            warn!("ZMQ endpoint {} not found!", mapping.target_endpoint_id);
                                         }
                                     }
                                 }
                             }
+                        }
+                        
+                        if !matched {
+                            debug!("No matching mapping found for topic: {}", msg.topic);
                         }
                     }
                     else => {
@@ -426,9 +438,14 @@ fn run_zmq_worker(
         if matches!(config.socket_type, ZmqSocketType::XSub | ZmqSocketType::Sub) {
             match socket.recv_bytes(0) {
                 Ok(data) => {
+                    info!("[ZMQ:{}] Received {} bytes", config.name, data.len());
+                    
+                    // Parse topic and payload (format: "topic payload")
                     if let Some(sep_pos) = data.iter().position(|&b| b == b' ') {
                         let topic = String::from_utf8_lossy(&data[..sep_pos]).to_string();
                         let payload = data[sep_pos + 1..].to_vec();
+
+                        info!("[ZMQ:{}] Parsed message: topic={}, payload_len={}", config.name, topic, payload.len());
 
                         let fwd_msg = ForwardMessage {
                             source: MessageSource::Zmq,
@@ -442,6 +459,9 @@ fn run_zmq_worker(
                                 error!("[ZMQ:{}] Failed to forward: {}", config.name, e);
                             }
                         });
+                    } else {
+                        // No space separator - treat entire message as topic or use alternative parsing
+                        warn!("[ZMQ:{}] Message has no space separator, raw: {:?}", config.name, String::from_utf8_lossy(&data));
                     }
                 }
                 Err(zmq::Error::EAGAIN) => {
@@ -453,9 +473,12 @@ fn run_zmq_worker(
                     }
                 }
             }
+        } else {
+            // For XPUB/PUB sockets, just sleep a bit to prevent busy loop
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
-        // Check for commands (for XPUB, PUB types)
+        // Check for commands (for all socket types that can publish: XPUB, PUB)
         if matches!(config.socket_type, ZmqSocketType::XPub | ZmqSocketType::Pub) {
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
@@ -463,8 +486,12 @@ fn run_zmq_worker(
                         let mut message = topic.as_bytes().to_vec();
                         message.push(b' ');
                         message.extend_from_slice(&payload);
-                        if let Err(e) = socket.send(&message, 0) {
-                            error!("[ZMQ:{}] Failed to send: {}", config.name, e);
+                        
+                        info!("[ZMQ:{}] Publishing to topic: {} ({} bytes)", config.name, topic, payload.len());
+                        
+                        match socket.send(&message, 0) {
+                            Ok(_) => debug!("[ZMQ:{}] Message sent successfully", config.name),
+                            Err(e) => error!("[ZMQ:{}] Failed to send: {}", config.name, e),
                         }
                     }
                 }

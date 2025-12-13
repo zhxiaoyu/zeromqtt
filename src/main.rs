@@ -57,6 +57,12 @@ async fn main() {
     let bridge = BridgeCore::new(repo.clone());
     info!("Bridge core created");
 
+    // Auto-start the bridge
+    match bridge.start().await {
+        Ok(()) => info!("🔗 Bridge started successfully"),
+        Err(e) => tracing::warn!("Failed to auto-start bridge: {} (can be started manually)", e),
+    }
+
     // Create application state
     let state = AppState::new(config.clone(), repo, bridge);
 

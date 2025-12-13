@@ -22,7 +22,9 @@ onMounted(async () => {
   await Promise.all([
     bridgeStore.fetchStatus(),
     bridgeStore.fetchStats(),
-    bridgeStore.fetchChartData()
+    bridgeStore.fetchChartData(),
+    bridgeStore.fetchMqttConfigs(),
+    bridgeStore.fetchZmqConfigs()
   ])
   
   // Auto-refresh every 5 seconds
@@ -53,6 +55,21 @@ const formatUptime = (seconds: number) => {
   }
   return `${secs}s`
 }
+
+// Overall connection status based on enabled endpoints
+const mqttConnectionStatus = computed(() => {
+  if (!bridgeStore.status || bridgeStore.status.state !== 'running') return 'disconnected'
+  const enabledBrokers = bridgeStore.mqttConfigs.filter(c => c.enabled)
+  if (enabledBrokers.length === 0) return 'disconnected'
+  return 'connected'
+})
+
+const zmqConnectionStatus = computed(() => {
+  if (!bridgeStore.status || bridgeStore.status.state !== 'running') return 'disconnected'
+  const enabledEndpoints = bridgeStore.zmqConfigs.filter(c => c.enabled)
+  if (enabledEndpoints.length === 0) return 'disconnected'
+  return 'connected'
+})
 
 // Chart data
 const chartOptions = {
@@ -217,10 +234,32 @@ const chartData = computed(() => {
         <!-- MQTT Status -->
         <div class="glass-card p-6">
           <div class="flex items-center justify-between mb-4">
-            <h3 class="text-lg font-semibold text-white">MQTT Connection</h3>
-            <StatusIndicator :status="bridgeStore.status?.mqtt_status || 'disconnected'" />
+            <div class="flex items-center gap-3">
+              <h3 class="text-lg font-semibold text-white">MQTT Brokers</h3>
+              <span class="text-xs px-2 py-1 rounded bg-cyan-500/20 text-cyan-400">
+                {{ bridgeStore.mqttConfigs.filter(c => c.enabled).length }} active
+              </span>
+            </div>
+            <StatusIndicator :status="mqttConnectionStatus" />
           </div>
-          <div class="grid grid-cols-2 gap-4">
+          
+          <!-- Endpoint list -->
+          <div v-if="bridgeStore.mqttConfigs.length" class="space-y-2 mb-4">
+            <div 
+              v-for="config in bridgeStore.mqttConfigs" 
+              :key="config.id" 
+              class="flex items-center justify-between p-2 rounded bg-slate-800/50"
+            >
+              <div class="flex items-center gap-2">
+                <div class="w-2 h-2 rounded-full" :class="config.enabled ? 'bg-emerald-500' : 'bg-slate-500'"></div>
+                <span class="text-sm text-slate-300">{{ config.name }}</span>
+              </div>
+              <span class="text-xs text-slate-500">{{ config.broker_url }}:{{ config.port }}</span>
+            </div>
+          </div>
+          <div v-else class="text-sm text-slate-500 mb-4">No MQTT brokers configured</div>
+          
+          <div class="grid grid-cols-2 gap-4 pt-4 border-t border-slate-700/50">
             <div>
               <p class="text-sm text-slate-400">Received</p>
               <p class="text-2xl font-bold text-cyan-400">{{ bridgeStore.stats?.mqtt_received?.toLocaleString() || 0 }}</p>
@@ -235,10 +274,33 @@ const chartData = computed(() => {
         <!-- ZeroMQ Status -->
         <div class="glass-card p-6">
           <div class="flex items-center justify-between mb-4">
-            <h3 class="text-lg font-semibold text-white">ZeroMQ Connection</h3>
-            <StatusIndicator :status="bridgeStore.status?.zmq_status || 'disconnected'" />
+            <div class="flex items-center gap-3">
+              <h3 class="text-lg font-semibold text-white">ZeroMQ Endpoints</h3>
+              <span class="text-xs px-2 py-1 rounded bg-purple-500/20 text-purple-400">
+                {{ bridgeStore.zmqConfigs.filter(c => c.enabled).length }} active
+              </span>
+            </div>
+            <StatusIndicator :status="zmqConnectionStatus" />
           </div>
-          <div class="grid grid-cols-2 gap-4">
+          
+          <!-- Endpoint list -->
+          <div v-if="bridgeStore.zmqConfigs.length" class="space-y-2 mb-4">
+            <div 
+              v-for="config in bridgeStore.zmqConfigs" 
+              :key="config.id" 
+              class="flex items-center justify-between p-2 rounded bg-slate-800/50"
+            >
+              <div class="flex items-center gap-2">
+                <div class="w-2 h-2 rounded-full" :class="config.enabled ? 'bg-emerald-500' : 'bg-slate-500'"></div>
+                <span class="text-sm text-slate-300">{{ config.name }}</span>
+                <span class="text-xs px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-400 uppercase">{{ config.socket_type }}</span>
+              </div>
+              <span class="text-xs text-slate-500">{{ config.bind_endpoint || 'No bind' }}</span>
+            </div>
+          </div>
+          <div v-else class="text-sm text-slate-500 mb-4">No ZeroMQ endpoints configured</div>
+          
+          <div class="grid grid-cols-2 gap-4 pt-4 border-t border-slate-700/50">
             <div>
               <p class="text-sm text-slate-400">Received</p>
               <p class="text-2xl font-bold text-purple-400">{{ bridgeStore.stats?.zmq_received?.toLocaleString() || 0 }}</p>
