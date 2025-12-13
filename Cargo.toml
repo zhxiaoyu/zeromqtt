@@ -2,6 +2,7 @@
 name = "zeromqtt"
 version = "0.1.0"
 edition = "2024"
+default-run = "zeromqtt"
 
 [dependencies]
 paho-mqtt = { version = "0.13", features=["vendored-ssl"] }
@@ -43,3 +44,10 @@ parking_lot = "0.12"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# HTTP client for E2E tests
+reqwest = { version = "0.12", features = ["json"] }
+
+[[bin]]
+name = "e2e_tests"
+path = "tests/e2e_tests.rs"
