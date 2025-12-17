@@ -693,6 +693,106 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ========================================================================
+    // Section 9: Telemetry Tests
+    // ========================================================================
+    section("9. Telemetry (Prometheus Metrics)");
+    
+    test("9.1 Prometheus Metrics Endpoint");
+    {
+        let response = api.client.get(format!("{}/metrics", API_BASE.replace("/api", "/api")))
+            .send()
+            .await;
+        
+        match response {
+            Ok(resp) if resp.status().is_success() => {
+                let text = resp.text().await.unwrap_or_default();
+                
+                // Verify Prometheus format
+                let has_help = text.contains("# HELP");
+                let has_type = text.contains("# TYPE");
+                let has_mqtt_received = text.contains("zeromqtt_mqtt_messages_received_total");
+                let has_mqtt_sent = text.contains("zeromqtt_mqtt_messages_sent_total");
+                let has_zmq_received = text.contains("zeromqtt_zmq_messages_received_total");
+                let has_zmq_sent = text.contains("zeromqtt_zmq_messages_sent_total");
+                let has_uptime = text.contains("zeromqtt_uptime_seconds");
+                let has_errors = text.contains("zeromqtt_errors_total");
+                let has_latency = text.contains("zeromqtt_latency_milliseconds");
+                
+                if has_help && has_type {
+                    ok("Valid Prometheus format (has # HELP and # TYPE)");
+                    results.pass();
+                } else {
+                    warn("Missing Prometheus format markers");
+                    results.fail();
+                }
+                
+                test("9.2 MQTT Metrics Present");
+                if has_mqtt_received && has_mqtt_sent {
+                    ok("MQTT metrics present");
+                    results.pass();
+                } else {
+                    warn(&format!("MQTT metrics missing: rx={}, tx={}", has_mqtt_received, has_mqtt_sent));
+                    results.fail();
+                }
+                
+                test("9.3 ZMQ Metrics Present");
+                if has_zmq_received && has_zmq_sent {
+                    ok("ZMQ metrics present");
+                    results.pass();
+                } else {
+                    warn(&format!("ZMQ metrics missing: rx={}, tx={}", has_zmq_received, has_zmq_sent));
+                    results.fail();
+                }
+                
+                test("9.4 Uptime Metric Present");
+                if has_uptime {
+                    ok("Uptime metric present");
+                    results.pass();
+                } else {
+                    warn("Uptime metric missing");
+                    results.fail();
+                }
+                
+                test("9.5 Error Counter Present");
+                if has_errors {
+                    ok("Error counter present");
+                    results.pass();
+                } else {
+                    warn("Error counter missing");
+                    results.fail();
+                }
+                
+                test("9.6 Latency Histogram Present");
+                if has_latency {
+                    ok("Latency histogram present");
+                    results.pass();
+                } else {
+                    warn("Latency histogram missing");
+                    results.fail();
+                }
+                
+                // Show sample of metrics
+                info("Sample metrics output:");
+                for line in text.lines().take(15) {
+                    info(&format!("  {}", line));
+                }
+            }
+            Ok(resp) => {
+                err(&format!("/api/metrics returned status: {}", resp.status()));
+                results.fail();
+                // Skip sub-tests
+                for _ in 0..5 { results.fail(); }
+            }
+            Err(e) => {
+                err(&format!("Failed to fetch /api/metrics: {}", e));
+                results.fail();
+                // Skip sub-tests
+                for _ in 0..5 { results.fail(); }
+            }
+        }
+    }
+
+    // ========================================================================
     // Summary
     // ========================================================================
     let (passed, failed) = results.summary();

@@ -2,7 +2,9 @@
 
 use crate::db::Repository;
 use crate::models::{MqttConfig, ZmqConfig, TopicMapping, ZmqSocketType, EndpointType};
+use crate::telemetry::metrics;
 use std::sync::Arc;
+use std::time::Instant;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use tokio::sync::mpsc;
@@ -137,14 +139,17 @@ impl BridgeWorker {
             while running_fwd.load(Ordering::SeqCst) {
                 tokio::select! {
                     Some(msg) = forward_rx.recv() => {
+                        let forward_start = Instant::now();
                         info!("Received message from {:?} id={}: topic={}", msg.source, msg.source_id, msg.topic);
                         
-                        // Track received stats
+                        // Track received stats (both DB and telemetry)
                         match msg.source {
                             MessageSource::Mqtt => {
+                                metrics().record_mqtt_received();
                                 let _ = repo_fwd.increment_stats(1, 0, 0, 0, 0).await;
                             }
                             MessageSource::Zmq => {
+                                metrics().record_zmq_received();
                                 let _ = repo_fwd.increment_stats(0, 0, 1, 0, 0).await;
                             }
                         }
@@ -178,8 +183,10 @@ impl BridgeWorker {
                                         if let Some(tx) = mqtt_cmd_txs.get(&mapping.target_endpoint_id) {
                                             info!("Forwarding to MQTT endpoint {}: {}", mapping.target_endpoint_id, target_topic);
                                             let _ = tx.send(MqttCommand::Publish(target_topic, msg.payload.clone()));
+                                            metrics().record_mqtt_sent();
                                             let _ = repo_fwd.increment_stats(0, 1, 0, 0, 0).await;
                                         } else {
+                                            metrics().record_error();
                                             warn!("MQTT endpoint {} not found!", mapping.target_endpoint_id);
                                         }
                                     }
@@ -187,8 +194,10 @@ impl BridgeWorker {
                                         if let Some(tx) = zmq_cmd_txs.get(&mapping.target_endpoint_id) {
                                             info!("Forwarding to ZMQ endpoint {}: {}", mapping.target_endpoint_id, target_topic);
                                             let _ = tx.send(ZmqCommand::Publish(target_topic, msg.payload.clone()));
+                                            metrics().record_zmq_sent();
                                             let _ = repo_fwd.increment_stats(0, 0, 0, 1, 0).await;
                                         } else {
+                                            metrics().record_error();
                                             warn!("ZMQ endpoint {} not found!", mapping.target_endpoint_id);
                                         }
                                     }
@@ -198,6 +207,10 @@ impl BridgeWorker {
                         
                         if !matched {
                             debug!("No matching mapping found for topic: {}", msg.topic);
+                        } else {
+                            // Record forwarding latency
+                            let latency_ms = forward_start.elapsed().as_secs_f64() * 1000.0;
+                            metrics().record_latency(latency_ms);
                         }
                     }
                     else => {
