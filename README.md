@@ -12,6 +12,7 @@ A powerful bidirectional bridge between ZeroMQ and MQTT protocols, supporting hi
 
 - **Bidirectional Bridging**: Seamless message forwarding between ZeroMQ (PUB/SUB, XPUB/XSUB) and MQTT protocols
 - **Web Dashboard**: Modern Vue 3 dashboard for real-time monitoring and configuration
+- **User Management**: Multi-user support with secure password storage (bcrypt)
 - **RESTful API**: Complete configuration management via HTTP API
 - **Dynamic Configuration**: Hot-reload topic mappings without restarting the bridge
 - **Topic Mapping**: Flexible topic transformation with MQTT wildcard support (`+`, `#`)

@@ -1,6 +1,6 @@
 //! Authentication API handlers
 
-use crate::auth::{encode_token, validate_credentials, AuthUser};
+use crate::auth::{encode_token, AuthUser};
 use crate::error::{AppError, AppResult};
 use crate::models::{LoginRequest, LoginResponse, MeResponse};
 use crate::state::AppState;
@@ -10,12 +10,16 @@ use axum::{
     Json, Router,
 };
 
-/// Login handler
+/// Login handler - validates credentials against database
 async fn login(
     State(state): State<AppState>,
     Json(req): Json<LoginRequest>,
 ) -> AppResult<Json<LoginResponse>> {
-    if !validate_credentials(&req.username, &req.password, &state.config) {
+    // Validate credentials using database
+    let user = state.repo.verify_credentials(&req.username, &req.password).await
+        .map_err(|e| AppError::DbError(format!("Database error: {}", e)))?;
+
+    if user.is_none() {
         return Err(AppError::AuthError(
             "Invalid username or password".to_string(),
         ));
@@ -43,3 +47,4 @@ pub fn auth_routes() -> Router<AppState> {
         .route("/login", post(login))
         .route("/me", get(me))
 }
+

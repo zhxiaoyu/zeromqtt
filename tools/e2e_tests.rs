@@ -122,6 +122,7 @@ impl ApiClient {
         self.client.get(format!("{}/config/zmq", self.base_url)).send().await?.json().await
     }
 
+    #[allow(dead_code)]
     async fn get_mappings(&self) -> Result<Vec<TopicMapping>, reqwest::Error> {
         self.client.get(format!("{}/config/mappings", self.base_url)).send().await?.json().await
     }
@@ -204,13 +205,12 @@ fn test_mqtt_to_zmq_message(topic: &str, payload: &str, timeout_ms: u64) -> bool
     // Publish MQTT
     let client_id = format!("e2e_pub_{}", chrono::Utc::now().timestamp_millis());
     if let Ok(mqtt_client) = mqtt::Client::new(mqtt::CreateOptionsBuilder::new()
-        .server_uri(MQTT_BROKER).client_id(&client_id).finalize()) 
+        .server_uri(MQTT_BROKER).client_id(&client_id).finalize())
+        && mqtt_client.connect(mqtt::ConnectOptionsBuilder::new().clean_session(true).finalize()).is_ok()
     {
-        if mqtt_client.connect(mqtt::ConnectOptionsBuilder::new().clean_session(true).finalize()).is_ok() {
-            let _ = mqtt_client.publish(mqtt::Message::new(topic, payload.as_bytes(), 1));
-            std::thread::sleep(Duration::from_millis(100));
-            let _ = mqtt_client.disconnect(None);
-        }
+        let _ = mqtt_client.publish(mqtt::Message::new(topic, payload.as_bytes(), 1));
+        std::thread::sleep(Duration::from_millis(100));
+        let _ = mqtt_client.disconnect(None);
     }
 
     let _ = zmq_handle.join();
@@ -234,18 +234,17 @@ fn test_zmq_to_mqtt_message(topic: &str, payload: &str, timeout_ms: u64) -> bool
         let opts = mqtt::CreateOptionsBuilder::new()
             .server_uri(MQTT_BROKER).client_id(&client_id).finalize();
         
-        if let Ok(client) = mqtt::Client::new(opts) {
+        if let Ok(client) = mqtt::Client::new(opts)
+            && client.connect(mqtt::ConnectOptionsBuilder::new().clean_session(true).finalize()).is_ok()
+        {
             let rx = client.start_consuming();
-            if client.connect(mqtt::ConnectOptionsBuilder::new().clean_session(true).finalize()).is_ok() {
-                if client.subscribe(&topic_clone, 1).is_ok() {
-                    if let Ok(Some(msg)) = rx.recv_timeout(Duration::from_millis(timeout_ms)) {
-                        if msg.payload_str().contains(&expected_payload) {
-                            received_clone.store(true, Ordering::SeqCst);
-                        }
-                    }
-                }
-                let _ = client.disconnect(None);
+            if client.subscribe(&topic_clone, 1).is_ok()
+                && let Ok(Some(msg)) = rx.recv_timeout(Duration::from_millis(timeout_ms))
+                && msg.payload_str().contains(&expected_payload)
+            {
+                received_clone.store(true, Ordering::SeqCst);
             }
+            let _ = client.disconnect(None);
         }
     });
 
@@ -254,14 +253,14 @@ fn test_zmq_to_mqtt_message(topic: &str, payload: &str, timeout_ms: u64) -> bool
     // Publish ZMQ
     let zmq_handle = std::thread::spawn(move || {
         let ctx = zmq::Context::new();
-        if let Ok(socket) = ctx.socket(zmq::PUB) {
-            if socket.bind(ZMQ_PUB_BIND).is_ok() {
-                std::thread::sleep(Duration::from_millis(300));
-                let msg = format!("{} {}", topic_for_zmq, payload_for_zmq);
-                for _ in 0..3 {
-                    let _ = socket.send(&msg, 0);
-                    std::thread::sleep(Duration::from_millis(200));
-                }
+        if let Ok(socket) = ctx.socket(zmq::PUB)
+            && socket.bind(ZMQ_PUB_BIND).is_ok()
+        {
+            std::thread::sleep(Duration::from_millis(300));
+            let msg = format!("{} {}", topic_for_zmq, payload_for_zmq);
+            for _ in 0..3 {
+                let _ = socket.send(&msg, 0);
+                std::thread::sleep(Duration::from_millis(200));
             }
         }
     });
@@ -378,10 +377,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 socket.connect(ZMQ_SUB_ENDPOINT).unwrap();
                 socket.set_subscribe(dst_clone.as_bytes()).unwrap();
                 socket.set_rcvtimeo(5000).unwrap();
-                if let Ok(msg) = socket.recv_msg(0) {
-                    if msg.as_str().unwrap_or("").contains(&payload_clone) {
-                        received_clone.store(true, Ordering::SeqCst);
-                    }
+                if let Ok(msg) = socket.recv_msg(0)
+                    && msg.as_str().unwrap_or("").contains(&payload_clone)
+                {
+                    received_clone.store(true, Ordering::SeqCst);
                 }
             });
 
@@ -389,12 +388,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Publish to source topic
             if let Ok(client) = mqtt::Client::new(mqtt::CreateOptionsBuilder::new()
-                .server_uri(MQTT_BROKER).client_id(format!("e2e_{}", test_id)).finalize()) 
+                .server_uri(MQTT_BROKER).client_id(format!("e2e_{}", test_id)).finalize())
+                && client.connect(mqtt::ConnectOptionsBuilder::new().clean_session(true).finalize()).is_ok()
             {
-                if client.connect(mqtt::ConnectOptionsBuilder::new().clean_session(true).finalize()).is_ok() {
-                    let _ = client.publish(mqtt::Message::new(&src, payload.as_bytes(), 1));
-                    let _ = client.disconnect(None);
-                }
+                let _ = client.publish(mqtt::Message::new(&src, payload.as_bytes(), 1));
+                let _ = client.disconnect(None);
             }
 
             let _ = zmq_handle.join();

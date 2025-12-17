@@ -23,6 +23,9 @@ pub enum AppError {
     #[error("Bad request: {0}")]
     BadRequest(String),
 
+    #[error("Database error: {0}")]
+    DbError(String),
+
     #[error("Internal server error: {0}")]
     Internal(String),
 }
@@ -41,6 +44,9 @@ impl IntoResponse for AppError {
             AppError::TokenError(msg) => (StatusCode::UNAUTHORIZED, "token_error", msg.clone()),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "not_found", msg.clone()),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "bad_request", msg.clone()),
+            AppError::DbError(msg) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, "db_error", msg.clone())
+            }
             AppError::Internal(msg) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error", msg.clone())
             }

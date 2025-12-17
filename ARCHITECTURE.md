@@ -75,9 +75,15 @@ ZeroMQTT 是一个高性能的双向桥接系统，实现了 ZeroMQ 和 MQTT 协
   - **身份认证**: 
     - 默认账户/密码: `zeromqtt` / `zeromqtt`
     - JWT Token 鉴权
+    - 密码使用 bcrypt 加密存储
+  - **用户管理**:
+    - 支持用户的增删改查
+    - 默认用户可修改密码但不能删除
+    - 所有用户拥有完整权限
 - **前端 (Vue 3 + TypeScript + TailwindCSS)**:
   - 实时状态大屏 (Dashboard)
   - 动态配置连接参数和映射规则
+  - 用户管理界面
   - 响应式设计
 
 #### 6. 监控与遥测 (新增)

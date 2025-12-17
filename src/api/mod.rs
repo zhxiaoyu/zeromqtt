@@ -3,8 +3,9 @@
 pub mod auth;
 pub mod bridge;
 pub mod config;
-pub mod status;
 pub mod metrics;
+pub mod status;
+pub mod users;
 
 use crate::state::AppState;
 use axum::Router;
@@ -12,8 +13,9 @@ use axum::Router;
 pub use auth::auth_routes;
 pub use bridge::bridge_routes;
 pub use config::config_routes;
-pub use status::status_routes;
 pub use metrics::metrics_routes;
+pub use status::status_routes;
+pub use users::users_routes;
 
 /// Create all API routes
 pub fn api_routes() -> Router<AppState> {
@@ -23,4 +25,6 @@ pub fn api_routes() -> Router<AppState> {
         .nest("/config", config_routes())
         .nest("/bridge", bridge_routes())
         .nest("/metrics", metrics_routes())
+        .nest("/users", users_routes())
 }
+

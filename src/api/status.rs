@@ -33,7 +33,7 @@ async fn get_stats(State(state): State<AppState>) -> AppResult<Json<MessageStats
         stats.messages_per_second = total_messages as f64 / elapsed;
         // Realistic latency based on message rate (simple estimate)
         stats.avg_latency_ms = 1.0 / (stats.messages_per_second + 1.0) * 100.0;
-        stats.avg_latency_ms = stats.avg_latency_ms.min(10.0).max(0.1);
+        stats.avg_latency_ms = stats.avg_latency_ms.clamp(0.1, 10.0);
     } else {
         stats.messages_per_second = 0.0;
         stats.avg_latency_ms = 0.0;

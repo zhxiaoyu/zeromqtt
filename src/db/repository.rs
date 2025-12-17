@@ -2,6 +2,7 @@
 
 use crate::models::{
     CreateMappingRequest, CreateMqttConfigRequest, CreateZmqConfigRequest,
+    CreateUserRequest, ChangePasswordRequest, UpdateUserRequest, UserRecord,
     EndpointType, MappingDirection, MessageStats, MqttConfig, TopicMapping,
     ZmqConfig, ZmqSocketType,
 };
@@ -143,6 +144,30 @@ struct MessageStatsRow {
     zmq_sent: i64,
     error_count: i64,
     start_time: i64,
+}
+
+#[derive(FromRow)]
+#[allow(dead_code)]
+struct UserRow {
+    id: i64,
+    username: String,
+    password_hash: String,
+    is_default: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl From<UserRow> for UserRecord {
+    fn from(row: UserRow) -> Self {
+        UserRecord {
+            id: row.id as u32,
+            username: row.username,
+            password_hash: row.password_hash,
+            is_default: row.is_default != 0,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+        }
+    }
 }
 
 // ============ Repository ============
@@ -552,5 +577,140 @@ impl Repository {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    // ============ User Management ============
+
+    pub async fn get_users(&self) -> Result<Vec<UserRecord>, sqlx::Error> {
+        let rows: Vec<UserRow> = sqlx::query_as("SELECT * FROM users ORDER BY id")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|r| r.into()).collect())
+    }
+
+    pub async fn get_user_by_id(&self, id: u32) -> Result<Option<UserRecord>, sqlx::Error> {
+        let row: Option<UserRow> = sqlx::query_as("SELECT * FROM users WHERE id = ?")
+            .bind(id as i64)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.into()))
+    }
+
+    pub async fn get_user_by_username(&self, username: &str) -> Result<Option<UserRecord>, sqlx::Error> {
+        let row: Option<UserRow> = sqlx::query_as("SELECT * FROM users WHERE username = ?")
+            .bind(username)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|r| r.into()))
+    }
+
+    pub async fn create_user(&self, req: &CreateUserRequest) -> Result<UserRecord, sqlx::Error> {
+        let now = chrono::Utc::now().timestamp();
+        let password_hash = bcrypt::hash(&req.password, bcrypt::DEFAULT_COST)
+            .map_err(|e| sqlx::Error::Protocol(format!("Failed to hash password: {}", e)))?;
+        
+        let result = sqlx::query(
+            r#"
+            INSERT INTO users (username, password_hash, is_default, created_at, updated_at)
+            VALUES (?, ?, 0, ?, ?)
+            "#,
+        )
+        .bind(&req.username)
+        .bind(&password_hash)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        let id = result.last_insert_rowid() as u32;
+        Ok(UserRecord {
+            id,
+            username: req.username.clone(),
+            password_hash,
+            is_default: false,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub async fn update_user(&self, id: u32, req: &UpdateUserRequest) -> Result<Option<UserRecord>, sqlx::Error> {
+        let now = chrono::Utc::now().timestamp();
+        let result = sqlx::query(
+            r#"
+            UPDATE users SET username = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&req.username)
+        .bind(now)
+        .bind(id as i64)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() > 0 {
+            self.get_user_by_id(id).await
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub async fn change_password(&self, id: u32, req: &ChangePasswordRequest) -> Result<bool, sqlx::Error> {
+        // Get current user to verify current password if provided
+        let user = self.get_user_by_id(id).await?;
+        if user.is_none() {
+            return Ok(false);
+        }
+        let user = user.unwrap();
+
+        // Verify current password if provided
+        if let Some(ref current_password) = req.current_password
+            && !bcrypt::verify(current_password, &user.password_hash).unwrap_or(false)
+        {
+            return Ok(false);
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let new_hash = bcrypt::hash(&req.new_password, bcrypt::DEFAULT_COST)
+            .map_err(|e| sqlx::Error::Protocol(format!("Failed to hash password: {}", e)))?;
+        
+        let result = sqlx::query(
+            r#"
+            UPDATE users SET password_hash = ?, updated_at = ?
+            WHERE id = ?
+            "#,
+        )
+        .bind(&new_hash)
+        .bind(now)
+        .bind(id as i64)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_user(&self, id: u32) -> Result<bool, sqlx::Error> {
+        // Check if user is default - cannot delete default user
+        let user = self.get_user_by_id(id).await?;
+        if let Some(u) = user
+            && u.is_default
+        {
+            return Ok(false); // Cannot delete default user
+        }
+
+        let result = sqlx::query("DELETE FROM users WHERE id = ? AND is_default = 0")
+            .bind(id as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn verify_credentials(&self, username: &str, password: &str) -> Result<Option<UserRecord>, sqlx::Error> {
+        let user = self.get_user_by_username(username).await?;
+        if let Some(ref u) = user
+            && bcrypt::verify(password, &u.password_hash).unwrap_or(false)
+        {
+            return Ok(user);
+        }
+        Ok(None)
     }
 }

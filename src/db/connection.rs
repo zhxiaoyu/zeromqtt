@@ -123,6 +123,22 @@ async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Create users table for user management
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // Migrate old tables if they exist
     migrate_old_tables(pool).await?;
 
@@ -273,6 +289,31 @@ async fn init_default_data(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         .bind(now)
         .execute(pool)
         .await?;
+    }
+
+    // Check if default user exists
+    let user_count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users")
+        .fetch_one(pool)
+        .await?;
+    
+    if user_count.0 == 0 {
+        let now = chrono::Utc::now().timestamp();
+        // Default password: zeromqtt (bcrypt hashed)
+        let password_hash = bcrypt::hash("zeromqtt", bcrypt::DEFAULT_COST)
+            .expect("Failed to hash default password");
+        sqlx::query(
+            r#"
+            INSERT INTO users (username, password_hash, is_default, created_at, updated_at)
+            VALUES ('zeromqtt', ?, 1, ?, ?)
+            "#,
+        )
+        .bind(&password_hash)
+        .bind(now)
+        .bind(now)
+        .execute(pool)
+        .await?;
+        
+        tracing::info!("Created default user: zeromqtt");
     }
 
     Ok(())
